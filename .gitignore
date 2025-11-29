@@ -1,0 +1,41 @@
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node / package managers
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+package-lock.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# IntelliJ IDEA / JetBrains
+.idea/*
+!.idea/codeStyles/
+!.idea/copyright/
+*.iml
+out/
+.gradle/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+
+# Local tooling / sandbox
+.env
+.env.*
+.venv/
+venv/
+.cache/
+.tmp/
+tmp/
