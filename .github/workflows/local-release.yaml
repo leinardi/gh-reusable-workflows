@@ -9,6 +9,6 @@ on:
 
 jobs:
   release:
-    uses: leinardi/gh-reusable-workflows/.github/workflows/simple-tag-and-release.yaml@v1
+    uses: leinardi/gh-reusable-workflows/.github/workflows/simple-tag-and-release.yaml@55876c601aa07ae1683b2b8c439c06a573fbc452 # TODO replace with tag once released
     with:
       semver: ${{ inputs.semver }}
