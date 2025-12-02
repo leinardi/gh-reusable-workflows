@@ -1,0 +1,49 @@
+name: Pre-commit Cache Warm-up (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        type: string
+        required: false
+        default: "3.x"
+      cache_key_prefix:
+        type: string
+        required: false
+        default: "pre-commit"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }} @ ${{ github.repository }} @ ${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  warm-pre-commit-cache:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install pre-commit
+        run: pip install --no-cache-dir pre-commit
+
+      - name: Cache pre-commit
+        id: precommit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: ${{ inputs.cache_key_prefix }}|${{ runner.os }}|${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Warm up hook environments
+        if: steps.precommit.outputs.cache-hit != 'true'
+        run: pre-commit install-hooks
