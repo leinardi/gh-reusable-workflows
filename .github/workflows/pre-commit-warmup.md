@@ -17,15 +17,15 @@ This speeds up later workflows that run `pre-commit` (for example on pull reques
 
 ### `python_version` (optional)
 
-- **Type:** `string`  
-- **Default:** `"3.x"`  
-- Python version to use for installing and running `pre-commit`.  
+- **Type:** `string`
+- **Default:** `"3.x"`
+- Python version to use for installing and running `pre-commit`.
   Example: `"3.12"`.
 
 ### `cache_key_prefix` (optional)
 
-- **Type:** `string`  
-- **Default:** `"pre-commit"`  
+- **Type:** `string`
+- **Default:** `"pre-commit"`
 - Prefix used in the cache key for the `~/.cache/pre-commit` directory.
 
 ---
