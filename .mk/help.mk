@@ -8,7 +8,9 @@ endif
 
 .PHONY: help
 help: ## Show this help and usage
-	@awk 'BEGIN {FS=":.*##"; print "\nTargets:"} /^[a-zA-Z0-9_\/-]+:.*##/ { printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS=":.*##"} /^[a-zA-Z0-9_\/-]+:.*##/ { printf "%s:%s\n", $$1, $$2 }' $(MAKEFILE_LIST) \
+	  | sort \
+	  | awk 'BEGIN {FS=":"; print "\nTargets:"} { printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2 }'
 	@echo ""
 
 endif  # MK_COMMON_HELP_INCLUDED
