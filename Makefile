@@ -2,7 +2,7 @@
 REPO_ROOT := $(shell git rev-parse --show-toplevel 2>/dev/null || pwd)
 
 MK_COMMON_REPO        ?= leinardi/make-common
-MK_COMMON_VERSION     ?= v1.1.0
+MK_COMMON_VERSION     ?= v1
 
 MK_COMMON_DIR         := $(REPO_ROOT)/.mk
 MK_COMMON_FILES       := help.mk pre-commit.mk password.mk
@@ -18,3 +18,12 @@ MK_COMMON_BOOTSTRAP := $(shell "$(MK_COMMON_BOOTSTRAP_SCRIPT)" \
 
 # Include shared make logic
 include $(addprefix $(MK_COMMON_DIR)/,$(MK_COMMON_FILES))
+
+.PHONY: mk-common-update
+mk-common-update: ## Check for remote updates of shared .mk files
+	@echo "[mk] Checking for updates from $(MK_COMMON_REPO)@$(MK_COMMON_VERSION)"
+	MK_COMMON_UPDATE=1 "$(MK_COMMON_BOOTSTRAP_SCRIPT)" \
+	  "$(MK_COMMON_REPO)" \
+	  "$(MK_COMMON_VERSION)" \
+	  "$(MK_COMMON_DIR)" \
+	  "$(MK_COMMON_FILES)"
