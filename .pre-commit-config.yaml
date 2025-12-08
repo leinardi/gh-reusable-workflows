@@ -9,6 +9,10 @@ repos:
       - id: check-json
       - id: check-toml
       - id: check-added-large-files
+  - repo: https://github.com/checkmake/checkmake.git
+    rev: 0.2.2
+    hooks:
+      - id: checkmake
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.19.0
     hooks:
@@ -17,7 +21,6 @@ repos:
           # add stubs the project needs
           - types-requests
           - types-setuptools
-        exclude: ^bin/
       - id: mypy
         alias: mypy-json-output
         name: mypy (json output)
@@ -36,20 +39,16 @@ repos:
           # add stubs the project needs
           - types-requests
           - types-setuptools
-        exclude: ^bin/
         stages: [manual]
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.14.7
     hooks:
       - id: ruff-check
         args: ["--fix"]
-        exclude: ^bin/
       - id: ruff-format
-        exclude: ^bin/
       - id: ruff-check
         alias: ruff-check-rdjson
         args: ["--fix", "-q", "--output-format=rdjson"]
-        exclude: ^bin/
         stages: [manual]
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.9
@@ -96,7 +95,7 @@ repos:
         name: prettier-yaml
         entry: prettier
         language: node
-        additional_dependencies: ["prettier@3.5.3"]
+        additional_dependencies: ["prettier@3.7.4"]
         files: \.(yml|yaml)$
         args: ["--write"]
   - repo: https://github.com/adrienverge/yamllint
