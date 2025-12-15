@@ -17,7 +17,7 @@ updates:
   #     interval: "weekly"
   #   labels:
   #     - "dependencies"
-  #     - "npm"
+  #     - "ci"
 
   # If you add Python tooling with requirements/pyproject, uncomment:
   # - package-ecosystem: "pip"
@@ -26,4 +26,4 @@ updates:
   #     interval: "weekly"
   #   labels:
   #     - "dependencies"
-  #     - "python"
+  #     - "ci"
