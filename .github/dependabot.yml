@@ -7,7 +7,7 @@ updates:
       interval: "weekly"
     labels:
       - "dependencies"
-      - "github-actions"
+      - "ci"
     open-pull-requests-limit: 5
 
   # If you add a Node-based action with package.json, uncomment:
