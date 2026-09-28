@@ -271,6 +271,24 @@ expect_version "recovering an older release on its own commit works" v1.2.1
 resolve "1.2.2"
 expect_fail "a new lower version is still refused" "lower than the latest release"
 
+new_repo
+release_tag v1.5.1
+commit "feat(core): the feature"
+OFF=$(git -C "$REPO" rev-parse HEAD)
+git -C "$REPO" reset -q --hard HEAD~1
+release_tag v1.6.0 "$OFF"
+commit "feat(core): the feature, landed again"
+resolve ""
+expect_fail "a derived version equal to a release tagged off the branch names the cause" "not in this branch's history, so the version was derived from v1.5.1"
+git -C "$REPO" reset -q --hard HEAD~1
+commit "fix(core): the change, landed again as a fix"
+resolve ""
+expect_fail "a derived version below a release tagged off the branch names the cause" "not in this branch's history, so the version was derived from v1.5.1"
+resolve "1.5.2"
+if ! grep -q "not in this branch's history" <<<"$LOG"; then ok "an explicit lower version gets no off-branch hint"; else not_ok "an explicit lower version gets no off-branch hint" "$LOG"; fi
+resolve "1.6.1"
+expect_version "an explicit version above the off-branch release works" v1.6.1
+
 echo "# reconcile"
 
 ASSETS="$WORK/assets"
