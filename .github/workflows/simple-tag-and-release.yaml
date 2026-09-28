@@ -1,12 +1,45 @@
 name: Release (reusable)
 
+# Resolves a release version (explicit, or derived from the Conventional Commits
+# since the last release by svu), then reconciles the GitHub release for it:
+# draft, assets, publish, and the moving `vMAJOR` / `latest` tags. Every step is
+# idempotent, so re-running a failed run finishes what it started.
+#
+# Release tags are immutable in the repositories that call this ("Immutable
+# tags" ruleset: no update, no deletion), so nothing here creates a tag and
+# deletes it on failure. The tag is created by publishing the draft, which is
+# the last irreversible step; everything that can fail runs before it.
+#
+# The inline scripts are tested by scripts/test-simple-tag-and-release.sh, which
+# extracts them from this file with yq. Keep each one self-contained: it reads
+# its inputs from env only.
 on:
   workflow_call:
     inputs:
-      semver:
-        description: "Release Semantic Version (e.g. 1.15.2 or v1.15.2)"
-        required: true
+      version:
+        description: "Version, e.g. 1.2.0 or v1.2.0 (empty: derive from the commits since the last release)"
         type: string
+        required: false
+        default: ""
+      semver:
+        description: "Deprecated alias of `version`, kept for existing callers"
+        type: string
+        required: false
+        default: ""
+      dry_run:
+        description: "Resolve the version and print the plan; write nothing"
+        type: boolean
+        required: false
+        default: false
+      artifact_name:
+        description: "Name of an artifact uploaded earlier in the calling run; its files are attached to the release"
+        type: string
+        required: false
+        default: ""
+    outputs:
+      version:
+        description: "The released (or, on a dry run, the resolved) version, vX.Y.Z"
+        value: ${{ jobs.release.outputs.version }}
 
 permissions:
   contents: write
@@ -14,134 +47,394 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    steps:
-      - name: Check out full history
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
+    timeout-minutes: 15
+    # One release per repository at a time, never cancelled: two runs in flight
+    # would both pass "higher than every released version" and could publish in
+    # the wrong order.
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      # The one definition of a release tag: vMAJOR.MINOR.PATCH, strict SemVer
+      # core with no leading zeros, no pre-release and no build metadata. Every
+      # tag lookup filters through this, never through a glob.
+      RELEASE_TAG_REGEX: '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+      # Pinned by hand as one unit: version, archive and its SHA-256 (from the
+      # release's checksums.txt). Dependabot does not track a download.
+      SVU_VERSION: 3.4.1
+      SVU_ARCHIVE: svu_3.4.1_linux_amd64.tar.gz
+      SVU_SHA256: 7ee8c91998c15109130638dc661a912d5f426e2f8642f6f6c04e6502be920770
 
-      - name: Normalize version (ensure leading v)
-        id: ver
-        shell: bash
+    steps:
+      # workflow_dispatch lets the caller pick any branch. A release is cut from
+      # the default branch only; this fails rather than skips, so a run from
+      # elsewhere is red, not a green no-op.
+      - name: Refuse to release anything but the default branch
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          RAW="${{ inputs.semver }}"
-          if [[ "$RAW" =~ ^v ]]; then
-            VER="$RAW"
-          else
-            VER="v${RAW}"
+          if [ -z "$DEFAULT_BRANCH" ] || [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "A release runs from the default branch (${DEFAULT_BRANCH:-unknown}) only, got $REF. Nothing was changed." >&2
+            exit 1
           fi
-          MAJOR="${VER#v}"
-          MAJOR="${MAJOR%%.*}"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # svu reads the tags and the commits since the last one.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install svu
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/svu"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/$SVU_ARCHIVE" \
+            "https://github.com/caarlos0/svu/releases/download/v${SVU_VERSION}/${SVU_ARCHIVE}"
+          echo "$SVU_SHA256  $dir/$SVU_ARCHIVE" | sha256sum --check --strict
+          tar -xzf "$dir/$SVU_ARCHIVE" -C "$dir" svu
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Resolve the version to release
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SEMVER: ${{ inputs.semver }}
+        run: |
+          set -euo pipefail
+
+          # Prints the highest strict release tag in its input, or nothing.
+          highest_release() {
+            { grep -E "$RELEASE_TAG_REGEX" || true; } | sort -V | tail -n1
+          }
+          # Whether the release tag $1 sits on HEAD.
+          on_head() {
+            git tag --points-at HEAD | { grep -E "$RELEASE_TAG_REGEX" || true; } | grep -qxF "$1"
+          }
+          normalize() {
+            if [ -n "$1" ]; then
+              printf 'v%s' "${1#v}"
+            fi
+          }
+
+          V=$(normalize "$INPUT_VERSION")
+          S=$(normalize "$INPUT_SEMVER")
+          if [ -n "$V" ] && [ -n "$S" ] && [ "$V" != "$S" ]; then
+            echo "Both version ($INPUT_VERSION) and the deprecated semver ($INPUT_SEMVER) are set, and they differ. Pass only version." >&2
+            exit 1
+          fi
+          RAW="${V:-$S}"
+
+          if [ -n "$RAW" ]; then
+            VERSION="$RAW"
+            if ! [[ "$VERSION" =~ $RELEASE_TAG_REGEX ]]; then
+              echo "Version must be X.Y.Z or vX.Y.Z with no leading zeros, no pre-release and no build metadata (got '$RAW')." >&2
+              exit 1
+            fi
+            EXPLICIT=true
+          else
+            # svu is given the exact tag to count from, never a glob: it matches
+            # --tag.pattern against every tag, so a pattern would let a stray tag
+            # like v1.9.0-rc.1 become the current version.
+            CURRENT=$(git tag --merged HEAD | highest_release)
+            if [ -z "$CURRENT" ]; then
+              echo "No vX.Y.Z release tag is reachable from this commit, so there is nothing to derive a version from. Re-run with an explicit version." >&2
+              exit 1
+            fi
+            VERSION=$(svu next --tag.pattern "$CURRENT")
+            if ! [[ "$VERSION" =~ $RELEASE_TAG_REGEX ]]; then
+              echo "svu derived '$VERSION' from $CURRENT, which is not a vX.Y.Z release tag." >&2
+              exit 1
+            fi
+            # svu prints the current version unchanged when no feat/fix/breaking
+            # commit exists since the last release. That is not a release, unless
+            # the tag is on HEAD itself: then this re-runs one that published
+            # the tag and failed afterwards.
+            if [ "$VERSION" = "$CURRENT" ] && ! on_head "$VERSION"; then
+              echo "No feat/fix or breaking-change commit since ${CURRENT}, so there is nothing to bump. Re-run with an explicit version to force one." >&2
+              exit 1
+            fi
+            EXPLICIT=false
+          fi
+
+          # A recovery is this exact version already on HEAD, nothing wider.
+          RECOVERY=false
+          if on_head "$VERSION"; then
+            RECOVERY=true
+          fi
+
+          if [ "$RECOVERY" = "true" ]; then
+            PREVIOUS=$({ git tag --merged "HEAD^" 2>/dev/null || true; } | highest_release)
+          else
+            PREVIOUS=$(git tag --merged HEAD | highest_release)
+          fi
+
+          # A version must be higher than every version already released, except
+          # on a recovery, which reuses the version it failed on.
+          LATEST=$(git tag --list | highest_release)
+          if [ -n "$LATEST" ] && [ "$RECOVERY" != "true" ]; then
+            if [ "$VERSION" = "$LATEST" ]; then
+              echo "$VERSION is already released and does not point at this commit. Release a higher version." >&2
+              exit 1
+            fi
+            HIGHEST=$(printf '%s\n%s\n' "$VERSION" "$LATEST" | sort -V | tail -n1)
+            if [ "$HIGHEST" != "$VERSION" ]; then
+              echo "$VERSION is lower than the latest release $LATEST. Release tags are immutable, so only a higher version may be published." >&2
+              exit 1
+            fi
+          fi
+
+          MAJOR="${VERSION#v}"
+          MAJOR="v${MAJOR%%.*}"
+          echo "Resolved $VERSION (previous: ${PREVIOUS:-none}, explicit: $EXPLICIT, recovery: $RECOVERY)"
           {
-            echo "version=$VER"
+            echo "version=$VERSION"
+            echo "previous=$PREVIOUS"
+            echo "explicit=$EXPLICIT"
+            echo "recovery=$RECOVERY"
             echo "major=$MAJOR"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create release tag
-        id: create_tag
-        uses: actions/github-script@v9
+      - name: Download the release assets
+        if: inputs.artifact_name != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const version = '${{ steps.ver.outputs.version }}';
-            await github.rest.git.createRef({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              ref:   `refs/tags/${version}`,
-              sha:   context.sha
-            });
-            core.info(`Created tag '${version}' at commit ${context.sha}`);
+          name: ${{ inputs.artifact_name }}
+          path: ${{ runner.temp }}/release-assets
 
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.ver.outputs.version }}
-          generate_release_notes: true
+      # Draft, assets, publish. Each state a previous run can leave behind has
+      # its own branch, so a re-run finishes it:
+      #   no release          -> create a draft, upload, publish
+      #   draft               -> check its target, upload what is missing, publish
+      #   published           -> check the tag, upload what is missing, no re-publish
+      # A same-name asset whose content differs is never replaced: it fails.
+      - name: Reconcile the GitHub release
+        id: reconcile
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ github.sha }}
+          ASSETS_DIR: ${{ inputs.artifact_name != '' && format('{0}/release-assets', runner.temp) || '' }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
 
-      - name: Delete release tag if workflow fails or is cancelled
-        if: ${{ (failure() || cancelled()) && steps.create_tag.outcome == 'success' }}
-        uses: actions/github-script@v9
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const version = '${{ steps.ver.outputs.version }}';
-            const ref = `tags/${version}`;
-            core.info(`Deleting tag ref '${ref}' due to failure or cancellation.`);
-            try {
-              await github.rest.git.deleteRef({
-                owner: context.repo.owner,
-                repo:  context.repo.repo,
-                ref
-              });
-            } catch (e) {
-              core.warning(`Failed to delete tag ${ref}: ${e.message}`);
-            }
+          # The highest strict release on the remote, counting $VERSION itself.
+          # Its own assignment, so a failed ls-remote stops the step instead of
+          # reading as "no tags".
+          REMOTE_TAGS=$(git ls-remote --tags --refs origin)
+          HIGHEST=$({ awk -F/ '{print $NF}' <<<"$REMOTE_TAGS"; echo "$VERSION"; } \
+            | { grep -E "$RELEASE_TAG_REGEX" || true; } | sort -V | tail -n1)
+          IS_LATEST=false
+          if [ "$HIGHEST" = "$VERSION" ]; then
+            IS_LATEST=true
+          fi
 
-      - name: Move/create major and latest tags
-        if: ${{ success() }}
-        uses: actions/github-script@v9
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const version = '${{ steps.ver.outputs.version }}';
-            const major   = '${{ steps.ver.outputs.major }}';
+          # The commit the remote tag points at, peeled, or nothing.
+          remote_tag_sha() {
+            local out
+            out=$(git ls-remote --tags origin "refs/tags/$1" "refs/tags/$1^{}")
+            awk -v p="refs/tags/$1^{}" '$2 == p {print $1; found=1} END {if (!found) exit 1}' <<<"$out" \
+              || awk -v t="refs/tags/$1" '$2 == t {print $1}' <<<"$out"
+          }
 
-            const versionRef        = `tags/${version}`;
-            const majorRefNoPrefix  = `tags/v${major}`;
-            const majorRefFull      = `refs/${majorRefNoPrefix}`;
-            const latestRefNoPrefix = `tags/latest`;
-            const latestRefFull     = `refs/${latestRefNoPrefix}`;
+          TAG_SHA=$(remote_tag_sha "$VERSION")
+          if [ -n "$TAG_SHA" ] && [ "$TAG_SHA" != "$TARGET" ]; then
+            echo "The tag $VERSION already exists on $TAG_SHA, not on this commit ($TARGET). Nothing was changed; it needs a human." >&2
+            exit 1
+          fi
 
-            // Resolve the commit SHA of the version tag
-            const newTag = await github.rest.git.getRef({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              ref:   versionRef
-            });
-            const commitSha = newTag.data.object.sha;
-            core.info(`'${version}' points to ${commitSha}`);
+          # Release state: none, draft or published.
+          STATE=none
+          if OUT=$(gh release view "$VERSION" --json isDraft,targetCommitish --jq '[.isDraft, .targetCommitish] | @tsv' 2>&1); then
+            IFS=$'\t' read -r IS_DRAFT DRAFT_TARGET <<<"$OUT"
+            if [ "$IS_DRAFT" = "true" ]; then
+              STATE=draft
+              if [ "$DRAFT_TARGET" != "$TARGET" ]; then
+                echo "The draft release $VERSION targets $DRAFT_TARGET, not this commit ($TARGET). Nothing was changed; it needs a human." >&2
+                exit 1
+              fi
+            else
+              STATE=published
+              if [ -z "$TAG_SHA" ]; then
+                echo "The release $VERSION is published but its tag is missing. Nothing was changed; it needs a human." >&2
+                exit 1
+              fi
+            fi
+          elif ! grep -qi 'release not found' <<<"$OUT"; then
+            echo "Could not tell whether the release $VERSION exists: $OUT" >&2
+            exit 1
+          fi
+          if [ "$STATE" = "none" ] && [ -n "$TAG_SHA" ]; then
+            echo "The tag $VERSION exists on this commit with no release: the release will be created on it."
+          fi
 
-            // Delete existing major tag if present
-            try {
-              await github.rest.git.deleteRef({
-                owner: context.repo.owner,
-                repo:  context.repo.repo,
-                ref:   majorRefNoPrefix
-              });
-              core.info(`Deleted existing major tag 'v${major}'.`);
-            } catch (e) {
-              core.warning(`No existing 'v${major}' tag to delete (or delete failed): ${e.message}`);
-            }
+          EXPECTED=()
+          if [ -n "$ASSETS_DIR" ]; then
+            # A release holds a flat list of files. Anything nested in the artifact
+            # would be left out silently, so it fails instead.
+            NESTED=$(find "$ASSETS_DIR" -mindepth 1 ! -type f -print -quit)
+            if [ -z "$NESTED" ]; then
+              NESTED=$(find "$ASSETS_DIR" -mindepth 2 -print -quit)
+            fi
+            if [ -n "$NESTED" ]; then
+              echo "The artifact holds '${NESTED#"$ASSETS_DIR"/}', which is not a top-level file. Upload a flat list of files to attach." >&2
+              exit 1
+            fi
+            mapfile -t EXPECTED < <(find "$ASSETS_DIR" -maxdepth 1 -type f -printf '%f\n' | sort)
+            if [ "${#EXPECTED[@]}" -eq 0 ]; then
+              echo "The artifact holds no files to attach." >&2
+              exit 1
+            fi
+          fi
 
-            // Create/update major tag
-            await github.rest.git.createRef({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              ref:   majorRefFull,
-              sha:   commitSha
-            });
-            core.info(`Created/updated major tag 'v${major}' -> ${commitSha}.`);
+          PUBLISHED=()
+          if [ "$STATE" != "none" ]; then
+            NAMES=$(gh release view "$VERSION" --json assets --jq '.assets[].name')
+            if [ -n "$NAMES" ]; then
+              mapfile -t PUBLISHED <<<"$NAMES"
+            fi
+          fi
+          expected() { printf '%s\n' "${EXPECTED[@]}" | grep -qxF "$1"; }
+          published() { printf '%s\n' "${PUBLISHED[@]}" | grep -qxF "$1"; }
 
-            // Delete existing 'latest' tag if present
-            try {
-              await github.rest.git.deleteRef({
-                owner: context.repo.owner,
-                repo:  context.repo.repo,
-                ref:   latestRefNoPrefix
-              });
-              core.info(`Deleted existing 'latest' tag.`);
-            } catch (e) {
-              core.warning(`No existing 'latest' tag to delete (or delete failed): ${e.message}`);
-            }
+          for name in "${PUBLISHED[@]}"; do
+            if ! expected "$name"; then
+              echo "The release $VERSION carries an unexpected asset '$name'. Nothing was changed; it needs a human." >&2
+              exit 1
+            fi
+          done
 
-            // Create/update 'latest' tag
-            await github.rest.git.createRef({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              ref:   latestRefFull,
-              sha:   commitSha
-            });
-            core.info(`Created/updated 'latest' -> ${commitSha}.`);
+          DOWNLOADS=$(mktemp -d)
+          MISSING=()
+          for name in "${EXPECTED[@]}"; do
+            if published "$name"; then
+              gh release download "$VERSION" --pattern "$name" --dir "$DOWNLOADS"
+              REMOTE_SUM=$(sha256sum "$DOWNLOADS/$name" | awk '{print $1}')
+              LOCAL_SUM=$(sha256sum "$ASSETS_DIR/$name" | awk '{print $1}')
+              if [ "$REMOTE_SUM" != "$LOCAL_SUM" ]; then
+                echo "The published $name ($REMOTE_SUM) differs from this run's ($LOCAL_SUM). Nothing was replaced; it needs a human." >&2
+                exit 1
+              fi
+            else
+              MISSING+=("$name")
+            fi
+          done
+
+          echo "Plan for $VERSION: release state '$STATE', tag ${TAG_SHA:-absent}, target $TARGET, latest=$IS_LATEST, assets to upload: ${MISSING[*]:-none}."
+          {
+            echo "state=$STATE"
+            echo "is_latest=$IS_LATEST"
+            echo "uploaded=${MISSING[*]}"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: nothing was changed."
+            exit 0
+          fi
+
+          if [ "$STATE" = "none" ]; then
+            gh release create "$VERSION" --draft --target "$TARGET" --title "$VERSION" --generate-notes --latest="$IS_LATEST"
+            STATE=draft
+          fi
+          for name in "${MISSING[@]}"; do
+            gh release upload "$VERSION" "$ASSETS_DIR/$name"
+          done
+          if [ "$STATE" = "draft" ]; then
+            # Publishing creates the tag on the target: the point of no return.
+            gh release edit "$VERSION" --draft=false --latest="$IS_LATEST"
+          fi
+
+          TAG_SHA=$(remote_tag_sha "$VERSION")
+          if [ "$TAG_SHA" != "$TARGET" ]; then
+            echo "After publishing, the tag $VERSION points at '${TAG_SHA:-nothing}', not at $TARGET. It needs a human." >&2
+            exit 1
+          fi
+
+          # GitHub's "Latest" badge follows the highest release, never a recovery
+          # of an older one. make_latest=false cannot take the badge away, so a
+          # wrong badge is fixed by marking the highest release instead.
+          CURRENT_LATEST=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+          if [ "$IS_LATEST" = "true" ] && [ "$CURRENT_LATEST" != "$VERSION" ]; then
+            gh release edit "$VERSION" --latest
+          elif [ "$IS_LATEST" != "true" ] && [ "$CURRENT_LATEST" = "$VERSION" ]; then
+            gh release edit "$HIGHEST" --latest \
+              || echo "::warning::$VERSION carries the Latest badge but $HIGHEST is higher, and $HIGHEST could not be marked Latest. Mark it by hand."
+          fi
+
+      # The moving tags go last, after a fresh look at the remote: a version that
+      # is not the highest overall does not take `latest`, and one that is not
+      # the highest of its major does not take `vMAJOR`. Recovering an older
+      # release therefore leaves both where they are.
+      - name: Move the major and latest tags
+        id: aliases
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          MAJOR: ${{ steps.version.outputs.major }}
+          TARGET: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REMOTE_TAGS=$(git ls-remote --tags --refs origin)
+          RELEASES=$(awk -F/ '{print $NF}' <<<"$REMOTE_TAGS" | { grep -E "$RELEASE_TAG_REGEX" || true; })
+          HIGHEST=$(sort -V <<<"$RELEASES" | tail -n1)
+          HIGHEST_IN_MAJOR=$({ grep -E "^${MAJOR}\\." <<<"$RELEASES" || true; } | sort -V | tail -n1)
+
+          # Points refs/tags/$1 at $TARGET: update in place, or create it.
+          move() {
+            if gh api "repos/$REPO/git/ref/tags/$1" >/dev/null 2>&1; then
+              gh api -X PATCH "repos/$REPO/git/refs/tags/$1" -f sha="$TARGET" -F force=true >/dev/null
+            else
+              gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/$1" -f sha="$TARGET" >/dev/null
+            fi
+            echo "Moved $1 to $TARGET ($VERSION)."
+          }
+
+          MOVED=()
+          if [ "$HIGHEST_IN_MAJOR" = "$VERSION" ]; then
+            move "$MAJOR"
+            MOVED+=("$MAJOR")
+          else
+            echo "::notice::$HIGHEST_IN_MAJOR is the highest $MAJOR release, so $MAJOR was left where it is."
+          fi
+          if [ "$HIGHEST" = "$VERSION" ]; then
+            move latest
+            MOVED+=(latest)
+          else
+            echo "::notice::$HIGHEST is the highest release, so latest was left where it is."
+          fi
+          echo "moved=${MOVED[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize
+        if: always() && steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PREVIOUS: ${{ steps.version.outputs.previous }}
+          EXPLICIT: ${{ steps.version.outputs.explicit }}
+          RECOVERY: ${{ steps.version.outputs.recovery }}
+          STATE: ${{ steps.reconcile.outputs.state }}
+          IS_LATEST: ${{ steps.reconcile.outputs.is_latest }}
+          UPLOADED: ${{ steps.reconcile.outputs.uploaded }}
+          MOVED: ${{ steps.aliases.outputs.moved }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          {
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "# Dry run: $VERSION"
+            else
+              echo "# Release $VERSION"
+            fi
+            echo
+            echo "- Previous release: ${PREVIOUS:-none}; explicit version: $EXPLICIT; recovery: $RECOVERY"
+            echo "- Release state found: ${STATE:-unknown}; marked latest: ${IS_LATEST:-unknown}"
+            echo "- Assets uploaded: ${UPLOADED:-none}"
+            echo "- Tags moved: ${MOVED:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"

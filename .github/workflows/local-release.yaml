@@ -3,14 +3,25 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      semver:
-        description: "Release Semantic Version (e.g. 1.15.2 or v1.15.2)"
-        required: true
+      version:
+        description: "Version, e.g. 1.3.0 or v1.3.0 (empty: derive from the commits since the last release)"
+        required: false
+        type: string
+      dry_run:
+        description: "Dry run: resolve the version and print the plan, change nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   release:
     permissions:
       contents: write
-    uses: leinardi/gh-reusable-workflows/.github/workflows/simple-tag-and-release.yaml@v1
+    # The local file, not @v1: every release of this repository runs the
+    # workflow it is about to publish.
+    uses: ./.github/workflows/simple-tag-and-release.yaml
     with:
-      semver: ${{ inputs.semver }}
+      version: ${{ inputs.version }}
+      dry_run: ${{ inputs.dry_run }}

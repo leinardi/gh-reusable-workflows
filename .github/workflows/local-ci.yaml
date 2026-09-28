@@ -8,115 +8,153 @@ concurrency:
   group: "${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}"
   cancel-in-progress: true
 
+# Every job reads the repository and nothing else, unless it says otherwise below.
+permissions:
+  contents: read
+
 jobs:
   actionlint:
+    # The reviewdog reporters comment on a pull request; there is none to comment on otherwise.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # reviewdog posts its findings as a pull request review, which needs pull-requests: write.
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Run actionlint via pre-commit + reviewdog
-        uses: leinardi/gha-pre-commit-reviewdog-actions/actionlint@v1
+        uses: leinardi/gha-pre-commit-reviewdog-actions/actionlint@61efb9b3eea9a6e0211fe0cff8dd811d1135b351 # v1.0.1
         with:
           from-ref: ${{ github.event.pull_request.base.sha }}
           to-ref: ${{ github.event.pull_request.head.sha }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
   pre-commit-hooks:
+    # The reviewdog reporters comment on a pull request; there is none to comment on otherwise.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # reviewdog posts its findings as a pull request review, which needs pull-requests: write.
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Run pre-commit hooks + reviewdog diff
-        uses: leinardi/gha-pre-commit-reviewdog-actions/pre-commit-hooks@v1
+        uses: leinardi/gha-pre-commit-reviewdog-actions/pre-commit-hooks@61efb9b3eea9a6e0211fe0cff8dd811d1135b351 # v1.0.1
         with:
           from-ref: ${{ github.event.pull_request.base.sha }}
           to-ref: ${{ github.event.pull_request.head.sha }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
   markdownlint:
+    # The reviewdog reporters comment on a pull request; there is none to comment on otherwise.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # reviewdog posts its findings as a pull request review, which needs pull-requests: write.
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Run markdownlint-cli2 via pre-commit + reviewdog
-        uses: leinardi/gha-pre-commit-reviewdog-actions/markdownlint-cli2@v1
-        with:
-          from-ref: ${{ github.event.pull_request.base.sha }}
-          to-ref: ${{ github.event.pull_request.head.sha }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-  mypy:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Run mypy via pre-commit + reviewdog
-        uses: leinardi/gha-pre-commit-reviewdog-actions/mypy@v1
-        with:
-          from-ref: ${{ github.event.pull_request.base.sha }}
-          to-ref: ${{ github.event.pull_request.head.sha }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-  ruff:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Run ruff via pre-commit + reviewdog
-        uses: leinardi/gha-pre-commit-reviewdog-actions/ruff@v1
+        uses: leinardi/gha-pre-commit-reviewdog-actions/markdownlint-cli2@61efb9b3eea9a6e0211fe0cff8dd811d1135b351 # v1.0.1
         with:
           from-ref: ${{ github.event.pull_request.base.sha }}
           to-ref: ${{ github.event.pull_request.head.sha }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
   shellcheck:
+    # The reviewdog reporters comment on a pull request; there is none to comment on otherwise.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # reviewdog posts its findings as a pull request review, which needs pull-requests: write.
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Run shellcheck via pre-commit + reviewdog
-        uses: leinardi/gha-pre-commit-reviewdog-actions/shellcheck@v1
+        uses: leinardi/gha-pre-commit-reviewdog-actions/shellcheck@61efb9b3eea9a6e0211fe0cff8dd811d1135b351 # v1.0.1
         with:
           from-ref: ${{ github.event.pull_request.base.sha }}
           to-ref: ${{ github.event.pull_request.head.sha }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
   yamllint:
+    # The reviewdog reporters comment on a pull request; there is none to comment on otherwise.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # reviewdog posts its findings as a pull request review, which needs pull-requests: write.
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Run yamllint via pre-commit + reviewdog
-        uses: leinardi/gha-pre-commit-reviewdog-actions/yamllint@v1
+        uses: leinardi/gha-pre-commit-reviewdog-actions/yamllint@61efb9b3eea9a6e0211fe0cff8dd811d1135b351 # v1.0.1
         with:
           from-ref: ${{ github.event.pull_request.base.sha }}
           to-ref: ${{ github.event.pull_request.head.sha }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  conventional-commits:
+    # Every commit in the pull request must follow Conventional Commits with a
+    # scope: callers' release versions are derived from commit types, and this
+    # repository's own are too. The local commit-msg hook only runs where
+    # `make pre-commit-install` was run; this job is the check no commit skips.
+    # It runs the repository's own conventional-pre-commit hook and skips merge
+    # commits. No pull-request title check: squash merging is disabled.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate the commit messages
+        uses: leinardi/gha-pre-commit-reviewdog-actions/conventional-commits@61efb9b3eea9a6e0211fe0cff8dd811d1135b351 # v1.0.1
+        with:
+          from-ref: ${{ github.event.pull_request.base.sha }}
+          to-ref: ${{ github.event.pull_request.head.sha }}
+
+  # The inline scripts of simple-tag-and-release.yaml, extracted with yq and run
+  # against throwaway repositories with a stub gh: no network but the pinned svu
+  # download, no token.
+  release-workflow-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Test simple-tag-and-release
+        run: make test

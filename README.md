@@ -18,7 +18,8 @@ jobs:
       # workflow-specific inputs
 ```
 
-* Use a **tag** (`@v1`, `@v1.0.0`, …) instead of `@main` for reproducibility.
+* Pin a **commit SHA** with the version in a trailing comment (`@<sha> # v1.3.0`), or at least a tag (`@v1`), never `@main`.
+  Dependabot keeps SHA pins current.
 * Filenames without a prefix are intended to be reusable.
 * Workflows with a prefix like `local-` are internal to this repo (e.g. `local-ci.yaml`).
 
@@ -27,10 +28,19 @@ jobs:
 ## Available workflows
 
 * **`simple-tag-and-release.yaml`**
-  Create a semantic version tag, GitHub Release, and update `vMAJOR` and `latest` tags.
+  Release the calling commit as `vX.Y.Z`: the version is passed or derived from Conventional Commits, the GitHub release is created
+  idempotently (optionally with build outputs attached), and `vMAJOR` / `latest` move when it is the highest release.
+* **`pre-commit-warmup.yaml`**
+  Fill the `pre-commit` cache on the default branch so pull-request jobs start warm.
 
 See the corresponding `.md` file next to each workflow (for example:
 `.github/workflows/simple-tag-and-release.md`) for details and examples.
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security issues: [SECURITY.md](SECURITY.md).
 
 ---
 
