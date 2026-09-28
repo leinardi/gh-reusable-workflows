@@ -177,14 +177,25 @@ jobs:
           # A version must be higher than every version already released, except
           # on a recovery, which reuses the version it failed on.
           LATEST=$(git tag --list | highest_release)
+          # A derived version counts from the highest release reachable from this
+          # commit. When the highest release overall is tagged on a commit
+          # outside this branch, that base is older: name it, so the failure
+          # explains itself.
+          off_branch_hint() {
+            if [ "$EXPLICIT" != "true" ] && ! git merge-base --is-ancestor "$LATEST" HEAD; then
+              echo "$LATEST is tagged on a commit that is not in this branch's history, so the version was derived from $CURRENT instead. Re-run with an explicit version higher than $LATEST." >&2
+            fi
+          }
           if [ -n "$LATEST" ] && [ "$RECOVERY" != "true" ]; then
             if [ "$VERSION" = "$LATEST" ]; then
               echo "$VERSION is already released and does not point at this commit. Release a higher version." >&2
+              off_branch_hint
               exit 1
             fi
             HIGHEST=$(printf '%s\n%s\n' "$VERSION" "$LATEST" | sort -V | tail -n1)
             if [ "$HIGHEST" != "$VERSION" ]; then
               echo "$VERSION is lower than the latest release $LATEST. Release tags are immutable, so only a higher version may be published." >&2
+              off_branch_hint
               exit 1
             fi
           fi
