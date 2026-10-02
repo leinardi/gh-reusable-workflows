@@ -5,9 +5,9 @@ description: >
   staged diff, a branch vs main, a commit range, or a PR. Hunts for breaking changes to
   `v1` callers, script injection through inputs, unpinned actions, permission creep,
   non-idempotent release steps, tags that could move backwards or be left orphaned, and
-  contract drift between a workflow and its `.md`, then reports ranked findings. Use
-  whenever the user asks to review changes/a diff/a PR/a branch, "check my work before
-  committing", "is this ready to merge", or "poke holes in this".
+  contract drift between a workflow and its `.md`, then reports ranked findings. Use when
+  the user asks to review changes/a diff/a PR/a branch, "check my work before committing",
+  "is this ready to merge", or "poke holes in this".
 ---
 
 # Adversarial Review — gh-reusable-workflows
@@ -17,11 +17,27 @@ runs in other repositories, with their token, the next time `v1` moves: the fail
 ships to every caller at once. Find the input, repository state or re-run where it breaks.
 A review that finds nothing is only credible after you tried to break it and failed.
 
+Copy this checklist and tick items as you go:
+
+```text
+Review progress:
+- [ ] 1. Diff and intent established (default scope if none given)
+- [ ] 2. AGENTS.md and the contracts it names read
+- [ ] 3. Repository invariants checked
+- [ ] 4. Adversarial passes run
+- [ ] 5. Findings confirmed or dropped; gates run
+- [ ] 6. Report written
+```
+
 ## 1. Establish the diff
+
+With no scope given, review the uncommitted work; if the tree is clean, review the branch
+against `main`.
 
 | User intent | Command |
 | --- | --- |
-| "my work" / uncommitted | `git status`, then `git diff HEAD` |
+| "my work" / uncommitted | `git status`, then `git diff HEAD`; read untracked files too |
+| staged changes only | `git diff --staged` |
 | a branch / "this PR" | `git diff main...HEAD` |
 | a commit range | `git diff <base>..<head>` |
 | a GitHub PR number | `gh pr diff <n>` and `gh pr view <n>` |
@@ -77,15 +93,16 @@ script without a new case in `scripts/test-simple-tag-and-release.sh` is a gap.
 
 ## 4. Adversarial passes
 
-- **Correctness:** inverted conditions, a `grep` that matches a prefix (`v1.2` vs `v1.20`),
-  `sort` without `-V`, an unanchored regex, `set -e` swallowed inside `$(...)` or a pipeline.
+- **Correctness:** a `grep` that matches a prefix (`v1.2` vs `v1.20`), `sort` without `-V`, an
+  unanchored regex, `set -e` swallowed inside `$(...)` or a pipeline.
 - **Empty and absent:** no tags at all, no releases, an empty artifact, an asset list that is
   empty, `gh` returning an error that is not "not found".
 - **Concurrency:** two runs in flight (job `concurrency` must serialize them), a tag pushed by
   someone else between the check and the publish.
 - **Contract drift:** the `.md`, `README.md` and `AGENTS.md` still describe what the YAML does.
 
-Prefer one reproducible defect over ten "consider"s. No named input and wrong result, no finding.
+For each candidate finding, reproduce it or trace the failing input end to end. If that confirms
+it, report it; if not, dig once more, then drop it. No named input and wrong result, no finding.
 
 ## 5. Verify
 
