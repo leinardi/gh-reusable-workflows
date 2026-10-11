@@ -9,7 +9,7 @@ time `v1` moves or Dependabot bumps their pin.
 | Workflow | Called as | What it does |
 | --- | --- | --- |
 | `.github/workflows/simple-tag-and-release.yaml` | reusable | Resolves a version (explicit or svu-derived), reconciles the GitHub release, moves `vMAJOR`/`latest`. |
-| `.github/workflows/pre-commit-warmup.yaml` | reusable | Fills the `pre-commit` cache on the default branch. |
+| `.github/workflows/pre-commit-warmup.yaml` | reusable | Fills the `pre-commit` cache on the default branch, then prunes the older caches of that ref. |
 | `.github/workflows/local-*.yaml` | this repo | This repository's own CI, release and warm-up. They call the local reusable files, not `@v1`. |
 
 Each reusable workflow has a `.md` next to it: its contract (inputs, outputs, behaviour, usage). Keep it in step with the YAML.
@@ -19,7 +19,7 @@ Each reusable workflow has a `.md` next to it: its contract (inputs, outputs, be
 ```bash
 make check             # pre-commit on all files (actionlint, yamllint, markdownlint, shellcheck, prettier, checkmake, …)
 make check-stage       # pre-commit on the staged files only
-make test              # scripts/test-simple-tag-and-release.sh: the release workflow's inline scripts, stub gh, no token
+make test              # scripts/test-*.sh: the reusable workflows' inline scripts, stub gh, no token
 make pre-commit-install  # installs the pre-commit and commit-msg hooks
 make mk-common-update  # refresh the shared .mk snippets from leinardi/make-common@v1
 ```
@@ -30,6 +30,7 @@ make mk-common-update  # refresh the shared .mk snippets from leinardi/make-comm
 | --- | --- |
 | `.github/workflows/` | the reusable workflows, their `.md` contracts, and the `local-*` workflows |
 | `scripts/test-simple-tag-and-release.sh` | extracts the release workflow's step scripts with `yq` and tests them |
+| `scripts/test-pre-commit-warmup.sh` | the same for the warm-up's `prune` step |
 | `scripts/bootstrap-mk-common.sh`, `.mk/` | shared make snippets from `leinardi/make-common`; `.mk/test.mk` is local |
 
 ## Invariants
@@ -46,7 +47,7 @@ make mk-common-update  # refresh the shared .mk snippets from leinardi/make-comm
 - **Idempotent.** Re-running a failed release finishes it. Anything that already exists and disagrees with this run (a tag or
   draft on another commit, an asset with other content) fails with "needs a human" instead of being replaced.
 - **The step scripts stay self-contained** (inputs from `env:` only), because `make test` extracts and runs them outside the
-  workflow. A change to a step script comes with a test case in `scripts/test-simple-tag-and-release.sh`.
+  workflow. A change to a step script comes with a test case in its `scripts/test-*.sh`.
 
 ## Commit messages
 

@@ -7,7 +7,7 @@ Install [`pre-commit`](https://pre-commit.com/), [`shellcheck`](https://www.shel
 `pre-commit` and the `commit-msg` hooks, so commit messages are checked when you commit.
 
 - `make check` runs the full pre-commit suite on every file, `make check-stage` on the staged files only.
-- `make test` tests the release workflow's inline scripts against throwaway repositories with a stub `gh`.
+- `make test` tests the reusable workflows' inline scripts (the release workflow's against throwaway repositories) with a stub `gh`.
 
 A reusable workflow is called by other repositories with their token and permissions: read [AGENTS.md](AGENTS.md) for the
 invariants a change must keep, and update the workflow's `.md` contract in the same pull request.

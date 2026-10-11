@@ -31,7 +31,8 @@ jobs:
   Release the calling commit as `vX.Y.Z`: the version is passed or derived from Conventional Commits, the GitHub release is created
   idempotently (optionally with build outputs attached), and `vMAJOR` / `latest` move when it is the highest release.
 * **`pre-commit-warmup.yaml`**
-  Fill the `pre-commit` cache on the default branch so pull-request jobs start warm.
+  Fill the `pre-commit` cache on the default branch so pull-request jobs start warm, and prune the
+  older caches it replaces.
 
 See the corresponding `.md` file next to each workflow (for example:
 `.github/workflows/simple-tag-and-release.md`) for details and examples.
