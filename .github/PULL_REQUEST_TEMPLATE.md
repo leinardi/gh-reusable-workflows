@@ -17,9 +17,11 @@ Any HTML comment will be stripped when the markdown is rendered, so you don't ne
   have run successfully
 - [ ] Every commit message follows
   [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) with a scope
-  (`type(scope): subject`)
+  (`type(scope): subject`), and its type matches whether the change ships (`feat`/`fix` only for
+  what callers run)
 - [ ] I have performed a self-review of my own code
 - [ ] There are no `WIP` commits in this PR
+- [ ] I ran the validation commands for every area touched (see the AGENTS.md validation matrix)
 
 ---
 
