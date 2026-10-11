@@ -43,6 +43,7 @@ against `main`.
 | a GitHub PR number | `gh pr diff <n>` and `gh pr view <n>` |
 
 Read `git log --oneline` for the range: the stated intent is what the code is checked against.
+A commit type that ships the wrong version is a finding too (pass in §4).
 Read every changed workflow in full, and its `.md` contract next to it.
 
 ## 2. Load project authority
@@ -59,7 +60,9 @@ and so is a `.md` promise the YAML does not keep.
   caller's result is a breaking change. Inside `v1` it is a **critical** finding.
 - `semver` must keep working as an alias of `version`.
 - An output removed or renamed breaks callers that read it.
-- A new required permission breaks every caller that grants only the old set.
+- A new required permission breaks every caller that grants only the old set. A job-level
+  `permissions:` that asks for more than a caller grants fails that caller's whole run at startup,
+  every job included, even when the job's `if:` is false.
 
 ### Injection and pinning
 
@@ -100,6 +103,18 @@ script without a new case in `scripts/test-simple-tag-and-release.sh` is a gap.
 - **Concurrency:** two runs in flight (job `concurrency` must serialize them), a tag pushed by
   someone else between the check and the publish.
 - **Contract drift:** the `.md`, `README.md` and `AGENTS.md` still describe what the YAML does.
+- **Commit type matches whether it ships:** `svu` derives this repository's release from the
+  commits since the last tag, and every commit lands as it is (merge commits). A change to what a
+  caller runs (a reusable workflow or anything it executes) typed `chore`, `ci`, `docs` or
+  `refactor` never reaches `v1`; a `feat` or `fix` on a `local-*` workflow, a test or a doc cuts a
+  release that moves `v1` for nothing; a stray `!` or `BREAKING CHANGE:` cuts a `v2`. `svu` also
+  matches `feat`/`fix` anywhere before a colon (`prefix:` counts as `fix:`). See `AGENTS.md`.
+- **A check that can no longer fail:** `scripts/test-*.sh` and `scripts/check-license-headers.sh`
+  guard claims nobody re-checks by hand. Make the guarded thing go wrong and see whether the check
+  still notices. A test whose `yq` extraction now returns nothing (a renamed step `id`), a case
+  that asserts on output the code no longer prints, a governed-file filter that matches no file, a
+  hook that lost `always_run`, or a CI job that skips the hook, adds `|| true` or
+  `continue-on-error`, is a false pass: a finding.
 
 For each candidate finding, reproduce it or trace the failing input end to end. If that confirms
 it, report it; if not, dig once more, then drop it. No named input and wrong result, no finding.
@@ -109,6 +124,8 @@ it, report it; if not, dig once more, then drop it. No named input and wrong res
 | Diff touched | Run |
 | --- | --- |
 | `simple-tag-and-release.yaml`, `scripts/test-*` | `make test`, then `make check` |
+| `pre-commit-warmup.yaml` | `make test`, then `make check` |
+| `scripts/check-license-headers.sh` | the script, once as is and once on a file without the header |
 | any workflow | `make check` (actionlint, yamllint, prettier) |
 | anything else | `make check` |
 

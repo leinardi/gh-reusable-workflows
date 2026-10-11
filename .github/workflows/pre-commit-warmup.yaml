@@ -11,9 +11,21 @@ on:
         type: string
         required: false
         default: "pre-commit"
+      prune:
+        description: >-
+          Delete the older pre-commit caches of the calling ref after the warm-up. Needs
+          `actions: write` on the calling job; without it the prune is skipped with a warning.
+        type: boolean
+        required: false
+        default: true
+      keep_caches:
+        description: How many of the newest pre-commit caches of the calling ref to keep (>= 1).
+        type: number
+        required: false
+        default: 2
 
-permissions:
-  contents: read
+# No workflow-level permissions on purpose: the warm-up job declares its own, and the prune job runs
+# with the calling job's grant (see the prune job).
 
 concurrency:
   group: "${{ github.workflow }} @ ${{ github.repository }} @ ${{ github.ref }}"
@@ -22,6 +34,8 @@ concurrency:
 jobs:
   warm-pre-commit-cache:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -47,3 +61,76 @@ jobs:
       - name: Warm up hook environments
         if: steps.precommit.outputs.cache-hit != 'true'
         run: pre-commit install-hooks
+
+  # Each change to .pre-commit-config.yaml saves a new cache entry, and the old ones would sit in the
+  # repository's cache quota until GitHub evicts them. This keeps the newest keep_caches entries of
+  # the calling ref under this key prefix and deletes the rest. It runs after a failed warm-up too:
+  # the older entries are still the ones to go.
+  #
+  # Deleting a cache needs `actions: write`. The job deliberately declares no permissions and runs
+  # with the calling job's grant: a nested job that requests a permission its caller does not grant
+  # fails the whole run at startup, warm-up included, whatever its `if:` says, so declaring it here
+  # would break every v1 caller that grants only `contents: read`. A caller without the grant gets a
+  # warning and a skipped prune instead, and its warm-up behaves as before.
+  prune:
+    needs: warm-pre-commit-cache
+    if: ${{ !cancelled() && inputs.prune }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Delete older pre-commit caches
+        # make test extracts this script by id (scripts/test-pre-commit-warmup.sh).
+        id: prune
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CACHE_REF: ${{ github.ref }}
+          KEY_PREFIX: ${{ inputs.cache_key_prefix }}
+          KEEP: ${{ inputs.keep_caches }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${KEEP}" =~ ^[0-9]+$ ]] || ((10#${KEEP} < 1)); then
+            echo "::error title=Invalid keep_caches::keep_caches must be a whole number >= 1, got '${KEEP}'."
+            exit 1
+          fi
+          keep=$((10#${KEEP}))
+
+          err="$(mktemp)"
+          trap 'rm -f "${err}"' EXIT
+
+          # gh reports a missing permission as "HTTP 403" on stderr, for the list (actions: read) and
+          # the delete (actions: write) alike.
+          skip_without_permission() {
+            echo "::warning title=pre-commit cache prune skipped::The calling job does not grant 'actions: write', so the older pre-commit caches were not deleted. Grant it on the calling job, or pass 'prune: false' to opt out."
+            exit 0
+          }
+
+          if ! ids="$(gh cache list --ref "${CACHE_REF}" --key "${KEY_PREFIX}|" --sort created_at --order desc \
+            --limit 100 --json id --jq ".[${keep}:][].id" 2>"${err}")"; then
+            if grep -q 'HTTP 403' "${err}"; then
+              skip_without_permission
+            fi
+            cat "${err}" >&2
+            exit 1
+          fi
+
+          if [[ -z "${ids}" ]]; then
+            echo "Nothing to prune: at most ${keep} '${KEY_PREFIX}|' caches on ${CACHE_REF}."
+            exit 0
+          fi
+
+          for id in ${ids}; do
+            if gh cache delete "${id}" 2>"${err}"; then
+              echo "Deleted cache ${id}."
+            elif grep -q 'HTTP 403' "${err}"; then
+              skip_without_permission
+            elif grep -q 'Could not find a cache' "${err}"; then
+              # Another run, or GitHub's own eviction, got there first.
+              echo "Cache ${id} is already gone."
+            else
+              cat "${err}" >&2
+              exit 1
+            fi
+          done
