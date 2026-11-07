@@ -476,7 +476,7 @@ for setup in "the default branch moved on" "someone pushed to it" "a human recom
 	else
 		bump_job 1.2.1
 		publish >/dev/null
-		git -C "$PUB" commit -q --allow-empty -m "feat(core): sneaked in"
+		git -C "$PUB" -c user.name=Human -c user.email=human@example.com commit -q --allow-empty -m "feat(core): sneaked in"
 		git -C "$PUB" push -q origin HEAD:refs/heads/release/v1.2.1
 		git -C "$REPO" reset -q --hard "$HEAD_SHA"
 		fresh_pub
@@ -720,7 +720,7 @@ if [ "$STATUS" -ne 0 ] && [ ! -s "$GH_STUB_DIR/calls" ]; then ok "a patch that i
 
 new_repo
 bump_job 1.2.1
-git -C "$PUB" commit -q --allow-empty -m "not the dispatched commit"
+git -C "$PUB" -c user.name=Human -c user.email=human@example.com commit -q --allow-empty -m "not the dispatched commit"
 publish
 expect_fail "a publish checkout that is not the dispatched commit is refused" "is not a clean $HEAD_SHA"
 
