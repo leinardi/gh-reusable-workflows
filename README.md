@@ -29,12 +29,24 @@ jobs:
 ## Available workflows
 
 * **`simple-tag-and-release.yaml`**
-  Release the calling commit as `vX.Y.Z`: the version is passed or derived from Conventional
-  Commits, the GitHub release is created idempotently (optionally with build outputs attached), and
-  `vMAJOR` / `latest` move when it is the highest release.
+  Release the calling commit as `vX.Y.Z` (or `<tag_prefix>X.Y.Z`): the version is passed or derived
+  from Conventional Commits, the GitHub release is created idempotently (optionally with build
+  outputs attached), and `vMAJOR` / `latest` move when it is the highest `v` release.
+* **`version-bump-pr.yaml`**
+  For a repository that commits its version: run the repository's bump command on a
+  `release/<tag>` branch, check the diff against an allow-list, open the pull request with
+  `GITHUB_TOKEN` and dispatch CI on it.
+* **`release-on-merge.yaml`**
+  The other half: on the push that merges that pull request, authorize the release through the
+  API (the pull request, its one bump commit, the files it changes) and wait for CI on the merge
+  commit; the caller's next job then tags and publishes it with `simple-tag-and-release`.
 * **`pre-commit-warmup.yaml`**
   Fill the `pre-commit` cache on the default branch so pull-request jobs start warm, and prune the
   older caches it replaces.
+
+The workflows build on the composite actions of
+[`leinardi/gh-composite-actions`](https://github.com/leinardi/gh-composite-actions) (`setup-svu`,
+`release-version`, `require-ci-green`, `prune-caches`), pinned by SHA.
 
 See the corresponding `.md` file next to each workflow (for example:
 `.github/workflows/simple-tag-and-release.md`) for details and examples.

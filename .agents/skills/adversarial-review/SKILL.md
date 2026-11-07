@@ -58,7 +58,8 @@ and so is a `.md` promise the YAML does not keep.
 
 - An input removed, renamed, made required, or given a new default that changes an existing
   caller's result is a breaking change. Inside `v1` it is a **critical** finding.
-- `semver` must keep working as an alias of `version`.
+- `semver` must keep working as an alias of `version`, and `tag_prefix` must default to `v` with
+  the behaviour `v` always had (`vMAJOR` and `latest` moving).
 - An output removed or renamed breaks callers that read it.
 - A new required permission breaks every caller that grants only the old set. A job-level
   `permissions:` that asks for more than a caller grants fails that caller's whole run at startup,
@@ -83,16 +84,45 @@ and so is a `.md` promise the YAML does not keep.
   itself. Walk the four states: nothing, draft, published with assets missing, complete.
 - **Never backwards.** `latest`, `vMAJOR` and GitHub's *Latest* badge move only to the highest
   release (of the major, for `vMAJOR`). Recovering an older version must leave all three alone.
-- **Strict versions.** Every tag lookup goes through `RELEASE_TAG_REGEX`. A glob, `git describe`,
-  or "the nearest tag" lets `v1.9.0-rc.1`, `latest` or `v1` become a version.
+- **Strict versions.** Every tag lookup goes through `RELEASE_TAG_REGEX` (built from `tag_prefix`
+  by the `input` step, dots escaped). A glob, `git describe`, `awk -F/ '{print $NF}'` (breaks a
+  prefix with a `/`) or "the nearest tag" lets `v1.9.0-rc.1`, `latest`, `v1` or another prefix's
+  tag become a version.
+- **Prefixes.** Only `v` moves tags. A `<prefix>MAJOR` is immutable under the callers' ruleset, so
+  creating one is a release that fails on its next run.
 - **Dry run** writes nothing: no draft, no upload, no ref, no badge.
 - The default-branch guard runs before anything that writes.
+
+### Committed-version releases (`version-bump-pr.yaml`, `release-on-merge.yaml`)
+
+- **Authorization is the API's, never a message's.** Anything that lets a commit subject, a branch
+  name alone, a fork, a person or another bot authorize a tag is **critical**. Exactly one PR must
+  qualify; an API error, an empty page read as "no PRs" without the retry bound, or a malformed
+  response that reads as "not qualifying" instead of failing are findings.
+- **CI before the tag.** `release-on-merge`'s `release` output is written only after
+  `require-ci-green` on `github.sha` with `accepted-events: push` passed, in the same job.
+- **Content, not just author.** Any workflow's `GITHUB_TOKEN` opens bot PRs: the PR must hold one
+  commit by version-bump-pr's identity, and it and the merge must change only `allowed_files`
+  (exact names, both sides of a rename, no control characters, fewer than 300 files). A
+  multi-commit push that changes the version must fail.
+- **Repository code never shares a job with a write token.** `version_command` and `bump_command`
+  run only in `contents: read` jobs. A job holding a write grant that runs any of it, or that uses
+  that job's outputs or patch without checking them again, or runs git without
+  `core.fsmonitor=false` and `core.hooksPath=/dev/null`, is **critical**.
+- **No nested reusable-workflow calls**: a `uses: ./.github/workflows/...` inside a reusable
+  workflow resolves ambiguously; callers make that call.
+- **The diff guard** fails on any path outside `allowed_files`, untracked and deleted files and both
+  sides of a rename included, on a path with a control character (never `grep -xF` a path), and on
+  a bump that commits or changes nothing; `publish` re-checks the applied patch the same way.
+- **Re-runs**: an open bot PR is reused, a branch with no open PR is recreated under a lease, an
+  existing tag fails before anything is written, and a dry run writes nothing.
 
 ### Tests
 
 `make test` extracts the step scripts by `id`. A renamed step `id`, or a script that now reads
 something other than `env:`, silently drops or breaks its tests. A behaviour change to a step
-script without a new case in `scripts/test-simple-tag-and-release.sh` is a gap.
+script without a new case in its `scripts/test-*.sh` is a gap. Logic moved into a
+`leinardi/gh-composite-actions` action is tested there; check that the pinned release has it.
 
 ## 4. Adversarial passes
 
@@ -123,7 +153,7 @@ it, report it; if not, dig once more, then drop it. No named input and wrong res
 
 | Diff touched | Run |
 | --- | --- |
-| `simple-tag-and-release.yaml`, `scripts/test-*` | `make test`, then `make check` |
+| `simple-tag-and-release.yaml`, `version-bump-pr.yaml`, `release-on-merge.yaml`, `scripts/test-*` | `make test`, then `make check` |
 | `pre-commit-warmup.yaml` | `make test`, then `make check` |
 | `scripts/check-license-headers.sh` | the script, once as is and once on a file without the header |
 | any workflow | `make check` (actionlint, yamllint, prettier) |

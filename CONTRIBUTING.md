@@ -11,8 +11,8 @@ scripts.
 
 - `make check` runs the full pre-commit suite on every file, `make check-stage` on the staged files
   only.
-- `make test` tests the reusable workflows' inline scripts (the release workflow's against throwaway
-  repositories) with a stub `gh`.
+- `make test` tests the reusable workflows' inline scripts (the release workflows' against throwaway
+  repositories) with a stub `gh`: no network, no token.
 
 A reusable workflow is called by other repositories with their token and permissions: read
 [AGENTS.md](AGENTS.md) for the invariants a change must keep, and update the workflow's `.md`
