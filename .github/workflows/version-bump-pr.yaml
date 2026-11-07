@@ -1,0 +1,532 @@
+name: Version bump PR (reusable)
+
+# The first half of a release for a repository that commits its version (a Cargo.toml workspace
+# version, a plugin.json): resolve the version, run the repository's own bump command, check that
+# it changed only the allowed files, push the result as one commit on `release/<tag>` cut from the
+# default branch, open a pull request with GITHUB_TOKEN and dispatch CI on it. Merging that pull
+# request is the release: release-on-merge.yaml authorizes it. No tag is ever created here.
+#
+# Two jobs, so repository code never runs next to a write token:
+#   bump     contents: read. Runs version_command and bump_command, checks the result, and uploads
+#            it as a patch artifact. Anything the commands do to this job (git config, hooks,
+#            GITHUB_ENV, GITHUB_PATH) stays in it.
+#   publish  the write grants. Runs no repository code: a fresh checkout of the same commit, the
+#            patch applied and checked again against allowed_files, then commit, push, pull
+#            request and CI dispatch with GITHUB_TOKEN.
+#
+# The inline scripts are tested by scripts/test-version-bump-pr.sh, which extracts them from this
+# file with yq. Keep each one self-contained: it reads its inputs from env only.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version, e.g. 1.2.0, v1.2.0 or <tag_prefix>1.2.0 (empty: derive from the commits since the last release)"
+        type: string
+        required: false
+        default: ""
+      dry_run:
+        description: "Resolve the version, run the bump and print its diff; push, open and dispatch nothing"
+        type: boolean
+        required: false
+        default: false
+      tag_prefix:
+        description: "Text before X.Y.Z in a release tag: `v` for vX.Y.Z, `<plugin>--v` for <plugin>--vX.Y.Z"
+        type: string
+        required: false
+        default: "v"
+      version_command:
+        description: >-
+          A command, run with bash from the repository root in the bump job, that prints the
+          version the repository carries now (X.Y.Z, one line). It is the floor: the new version
+          must be higher. It is run again after the bump and must then print the new version.
+        type: string
+        required: true
+      bump_command:
+        description: >-
+          A command, run with bash from the repository root in the bump job, that writes the new
+          version. It gets it in the environment as RELEASE_VERSION (X.Y.Z) and RELEASE_TAG
+          (<tag_prefix>X.Y.Z), for example `make release-bump VERSION="$RELEASE_VERSION"`. It runs
+          in a job with a read-only token and must not commit.
+        type: string
+        required: true
+      allowed_files:
+        description: >-
+          The files, relative to the repository root and separated by spaces or newlines, that the
+          bump may change. Any other change, an untracked file included, fails the run. Checked in
+          both jobs.
+        type: string
+        required: true
+      ci_workflow:
+        description: "The CI workflow file in .github/workflows to dispatch on the bump branch"
+        type: string
+        required: false
+        default: "ci.yaml"
+    outputs:
+      version:
+        description: "The version written, X.Y.Z"
+        value: ${{ jobs.publish.outputs.version }}
+      tag:
+        description: "The tag merging the pull request will release, <tag_prefix>X.Y.Z"
+        value: ${{ jobs.publish.outputs.tag }}
+      branch:
+        description: "The bump branch, release/<tag>"
+        value: ${{ jobs.publish.outputs.branch }}
+      pull_request:
+        description: "The number of the opened, refreshed or reused pull request; empty on a dry run"
+        value: ${{ jobs.publish.outputs.pull_request }}
+
+permissions:
+  contents: read
+
+# Two bumps at once would race for the same branch and version. A group of its own, so it neither
+# deadlocks with a caller's group nor waits for a release in progress.
+concurrency:
+  group: version-bump-pr-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  # Repository code runs here, with a read-only token and nothing else.
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+
+    steps:
+      # The bump branch is cut from the dispatched commit; from any other branch it would release
+      # commits that are not on the default branch. A failing step, so a wrong dispatch is red.
+      - name: Refuse to bump anything but the default branch
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEFAULT_BRANCH" ] || [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "A version bump runs from the default branch (${DEFAULT_BRANCH:-unknown}) only, got $REF. Nothing was changed." >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # svu reads the tags and the commits since the last one.
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Install svu
+        uses: leinardi/gh-composite-actions/setup-svu@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
+
+      - name: Read the version the repository carries
+        id: current
+        env:
+          VERSION_COMMAND: ${{ inputs.version_command }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION_COMMAND" ]; then
+            echo "version_command is empty. Nothing was changed." >&2
+            exit 1
+          fi
+          if ! CURRENT=$(bash -c "$VERSION_COMMAND"); then
+            echo "version_command failed. Nothing was changed." >&2
+            exit 1
+          fi
+          if ! [[ "$CURRENT" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "version_command printed '$CURRENT', not one X.Y.Z line. Nothing was changed." >&2
+            exit 1
+          fi
+          echo "The repository carries $CURRENT."
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+
+      # The carried version is the floor; the bump step makes it strict.
+      - name: Resolve the version to release
+        id: resolve
+        uses: leinardi/gh-composite-actions/release-version@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
+        with:
+          version: ${{ inputs.version }}
+          tag-prefix: ${{ inputs.tag_prefix }}
+          floor-version: ${{ steps.current.outputs.version }}
+
+      # Runs the repository's bump command and checks what it did: no commit, at least one change,
+      # only allowed paths, and the version command reading the new version back. The result is
+      # staged for the export step.
+      - name: Write the version
+        id: bump
+        env:
+          BUMP_COMMAND: ${{ inputs.bump_command }}
+          VERSION_COMMAND: ${{ inputs.version_command }}
+          ALLOWED_FILES: ${{ inputs.allowed_files }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_VERSION: ${{ steps.resolve.outputs.version }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
+          RECOVERY: ${{ steps.resolve.outputs.recovery }}
+          CURRENT_VERSION: ${{ steps.current.outputs.version }}
+          EXPECTED_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "$*" >&2
+            exit 1
+          }
+
+          # Checked again here, so nothing but a strict version ever reaches the bump command.
+          if ! [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || [ "$RELEASE_TAG" != "$TAG_PREFIX$RELEASE_VERSION" ]; then
+            fail "Refusing version '$RELEASE_VERSION' with tag '$RELEASE_TAG': not X.Y.Z under the prefix '$TAG_PREFIX'. Nothing was changed."
+          fi
+          if [ "$RECOVERY" = "true" ]; then
+            fail "The tag $RELEASE_TAG already marks this commit: $RELEASE_VERSION is released. Nothing was changed."
+          fi
+          if [ "$RELEASE_VERSION" = "$CURRENT_VERSION" ]; then
+            fail "The repository already carries $RELEASE_VERSION, so there is nothing to bump. If its tag is missing, the merge that wrote it was not released: release a higher version. Nothing was changed."
+          fi
+
+          # allowed_files as a set of exact paths.
+          declare -A ALLOWED=()
+          read -r -a ENTRIES <<<"$(tr '\n' ' ' <<<"$ALLOWED_FILES")"
+          if [ "${#ENTRIES[@]}" -eq 0 ]; then
+            fail "allowed_files is empty. Name the files the bump may change. Nothing was changed."
+          fi
+          for path in "${ENTRIES[@]}"; do
+            if [[ "$path" == *[[:cntrl:]]* || "$path" == /* || "/$path/" == */../* || "/$path/" == */./* || "/$path/" == */.git/* ]]; then
+              fail "allowed_files entry '$path' must be a plain path relative to the repository root. Nothing was changed."
+            fi
+            ALLOWED["$path"]=1
+          done
+
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            git status --short >&2
+            fail "The checkout is not clean before the bump. Nothing was changed."
+          fi
+
+          echo "Running the bump command for $RELEASE_VERSION ($RELEASE_TAG)."
+          export RELEASE_VERSION RELEASE_TAG
+          if ! bash -c "$BUMP_COMMAND"; then
+            fail "bump_command failed. Nothing was pushed."
+          fi
+
+          if [ "$(git rev-parse HEAD)" != "$EXPECTED_HEAD" ]; then
+            fail "bump_command moved HEAD to $(git rev-parse HEAD) (expected $EXPECTED_HEAD): it must change files, not commit. Nothing was pushed."
+          fi
+
+          # Every change, tracked or not (ignored files aside), as the commit will hold it. The
+          # publish job checks the applied patch again, independently of this job.
+          git add --all
+          mapfile -d '' -t CHANGED < <(git diff --cached --name-only --no-renames -z)
+          if [ "${#CHANGED[@]}" -eq 0 ]; then
+            fail "bump_command changed nothing. Nothing was pushed."
+          fi
+          OUTSIDE=()
+          for path in "${CHANGED[@]}"; do
+            if [[ "$path" == *[[:cntrl:]]* ]]; then
+              OUTSIDE+=("$(printf '%q' "$path")")
+            elif [ -z "${ALLOWED["$path"]+set}" ]; then
+              OUTSIDE+=("$path")
+            fi
+          done
+          if [ "${#OUTSIDE[@]}" -gt 0 ]; then
+            fail "bump_command changed files outside allowed_files: ${OUTSIDE[*]}. Nothing was pushed."
+          fi
+
+          if ! WRITTEN=$(bash -c "$VERSION_COMMAND"); then
+            fail "version_command failed after the bump. Nothing was pushed."
+          fi
+          if [ "$WRITTEN" != "$RELEASE_VERSION" ]; then
+            fail "After the bump, version_command prints '$WRITTEN', not $RELEASE_VERSION. Nothing was pushed."
+          fi
+
+          echo "The bump changes ${CHANGED[*]} (version $CURRENT_VERSION -> $RELEASE_VERSION):"
+          git --no-pager diff --cached --no-ext-diff --no-textconv
+
+      # The staged result as a binary patch. Git runs with external drivers and fsmonitor off, but
+      # this job ran repository code, so the publish job trusts nothing in the patch it does not
+      # check itself.
+      - name: Export the bump as a patch
+        id: export
+        env:
+          PATCH_DIR: ${{ runner.temp }}/version-bump-pr
+        run: |
+          set -euo pipefail
+          mkdir -p "$PATCH_DIR"
+          git -c core.fsmonitor=false diff --cached --binary --no-ext-diff --no-textconv --no-color --full-index \
+            >"$PATCH_DIR/bump.patch"
+          if [ ! -s "$PATCH_DIR/bump.patch" ]; then
+            echo "The bump produced an empty patch. Nothing was pushed." >&2
+            exit 1
+          fi
+
+      - name: Upload the patch
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: version-bump-pr-patch
+          path: ${{ runner.temp }}/version-bump-pr/bump.patch
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  # The write grants, and no repository code: nothing from the repository is executed, and the
+  # bump job's outputs and patch are checked again before they are used.
+  publish:
+    needs: bump
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Push the bump branch.
+      contents: write
+      # Open the pull request.
+      pull-requests: write
+      # `gh workflow run`: a pull request opened with GITHUB_TOKEN fires no `pull_request` run,
+      # and the required ci-result check must run on its head.
+      actions: write
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      tag: ${{ steps.publish.outputs.tag }}
+      branch: ${{ steps.publish.outputs.branch }}
+      pull_request: ${{ steps.publish.outputs.pull_request }}
+
+    steps:
+      - name: Refuse to publish anything but the default branch
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEFAULT_BRANCH" ] || [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "A version bump runs from the default branch (${DEFAULT_BRANCH:-unknown}) only, got $REF. Nothing was changed." >&2
+            exit 1
+          fi
+
+      # A fresh checkout of the same commit: nothing the bump job did to its own .git is here.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download the patch
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: version-bump-pr-patch
+          path: ${{ runner.temp }}/version-bump-pr
+
+      # Checks the patch, then one read of the remote state, then the writes it calls for:
+      #   tag exists                        -> fail: that version is released or being released
+      #   open bot PR, branch is this bump  -> reuse it and dispatch CI again
+      #   open bot PR, branch out of date   -> push this bump onto it (under a lease), dispatch CI
+      #   open PR by anyone else, or two    -> fail: it needs a human
+      #   no open PR                        -> (re)create the branch, open the PR, dispatch CI
+      - name: Push the branch, open the pull request, run CI
+        id: publish
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.bump.outputs.version }}
+          TAG: ${{ needs.bump.outputs.tag }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          ALLOWED_FILES: ${{ inputs.allowed_files }}
+          CI_WORKFLOW: ${{ inputs.ci_workflow }}
+          PATCH: ${{ runner.temp }}/version-bump-pr/bump.patch
+          GH_TOKEN: ${{ github.token }}
+          # The push authenticates with GITHUB_TOKEN through this helper, for this step only: the
+          # checkout did not persist a credential. Git runs it with the step's env.
+          GIT_TERMINAL_PROMPT: "0"
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!f() { if [ "$1" = get ]; then echo username=x-access-token; echo "password=$GH_TOKEN"; fi; }; f'
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "$*" >&2
+            exit 1
+          }
+          # Belt and braces: no hook, fsmonitor, external diff or signing program runs while the
+          # token is in the environment, whatever the checkout's config says.
+          SAFE_GIT=(git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.untrackedCache=false
+            -c commit.gpgsign=false -c core.pager=cat)
+          BOT_NAME="github-actions[bot]"
+          BOT_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The bump job's outputs, checked again: that job ran repository code.
+          if [ -z "$TAG_PREFIX" ] || ! [[ "$TAG_PREFIX" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            fail "tag_prefix '$TAG_PREFIX' must be non-empty and hold only letters, digits and '.', '_', '/', '-'. Nothing was changed."
+          fi
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || [ "$TAG" != "$TAG_PREFIX$VERSION" ]; then
+            fail "Refusing version '$VERSION' with tag '$TAG' from the bump job: not X.Y.Z under the prefix '$TAG_PREFIX'. Nothing was changed."
+          fi
+          if ! [[ "$CI_WORKFLOW" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]]; then
+            fail "ci_workflow must be a file name in .github/workflows, such as ci.yaml (got '$CI_WORKFLOW'). Nothing was changed."
+          fi
+          BRANCH="release/$TAG"
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "branch=$BRANCH"
+          } >> "$GITHUB_OUTPUT"
+
+          declare -A ALLOWED=()
+          read -r -a ENTRIES <<<"$(tr '\n' ' ' <<<"$ALLOWED_FILES")"
+          if [ "${#ENTRIES[@]}" -eq 0 ]; then
+            fail "allowed_files is empty. Nothing was changed."
+          fi
+          for path in "${ENTRIES[@]}"; do
+            if [[ "$path" == *[[:cntrl:]]* || "$path" == /* || "/$path/" == */../* || "/$path/" == */./* || "/$path/" == */.git/* ]]; then
+              fail "allowed_files entry '$path' must be a plain path relative to the repository root. Nothing was changed."
+            fi
+            ALLOWED["$path"]=1
+          done
+
+          # Apply the patch onto the dispatched commit and judge what it changes, from the index.
+          if [ "$("${SAFE_GIT[@]}" rev-parse HEAD)" != "$BASE_SHA" ] \
+            || [ -n "$("${SAFE_GIT[@]}" status --porcelain --untracked-files=all)" ]; then
+            fail "The checkout is not a clean $BASE_SHA. Nothing was changed."
+          fi
+          if ! "${SAFE_GIT[@]}" apply --index --check "$PATCH"; then
+            fail "The bump patch does not apply to $BASE_SHA. Nothing was changed."
+          fi
+          "${SAFE_GIT[@]}" apply --index "$PATCH"
+          mapfile -d '' -t RAW < <("${SAFE_GIT[@]}" diff --cached --raw -z --no-renames --no-ext-diff)
+          CHANGED=()
+          BAD=()
+          for ((i = 0; i + 1 < ${#RAW[@]}; i += 2)); do
+            read -r _ new_mode _ _ _ <<<"${RAW[i]#:}"
+            path=${RAW[i + 1]}
+            if [[ "$path" == *[[:cntrl:]]* ]]; then
+              BAD+=("$(printf '%q' "$path") (control character)")
+            elif [ -z "${ALLOWED["$path"]+set}" ]; then
+              BAD+=("$path (not in allowed_files)")
+            elif [[ "$new_mode" != 100644 && "$new_mode" != 100755 && "$new_mode" != 000000 ]]; then
+              BAD+=("$path (mode $new_mode: only regular files)")
+            fi
+            CHANGED+=("$path")
+          done
+          if [ "${#CHANGED[@]}" -eq 0 ]; then
+            fail "The bump patch changes nothing. Nothing was changed."
+          fi
+          if [ "${#BAD[@]}" -gt 0 ]; then
+            fail "The bump patch changes what it may not: ${BAD[*]}. Nothing was changed."
+          fi
+          TREE=$("${SAFE_GIT[@]}" write-tree)
+          echo "The bump changes ${CHANGED[*]}:"
+          "${SAFE_GIT[@]}" --no-pager diff --cached --no-ext-diff --no-textconv
+
+          # The tag must not exist: a matching-refs listing is empty when nothing matches, so an
+          # API error can never read as "absent".
+          if ! REFS=$(gh api "repos/$REPO/git/matching-refs/tags/$TAG" --jq '.[].ref'); then
+            fail "Could not read the tags of $REPO. Nothing was changed."
+          fi
+          if grep -qxF "refs/tags/$TAG" <<<"$REFS"; then
+            fail "The tag $TAG already exists: $VERSION is released, or its release is in progress. Nothing was changed."
+          fi
+
+          # The branch as it is now: the lease of the push below. Its own assignment, so a failed
+          # ls-remote stops the step instead of reading as "absent".
+          REMOTE=$("${SAFE_GIT[@]}" ls-remote --heads origin "refs/heads/$BRANCH")
+          OBSERVED=$(awk -v r="refs/heads/$BRANCH" '$2 == r { print $1 }' <<<"$REMOTE")
+
+          # Open pull requests from this repository's $BRANCH into the default branch.
+          if ! PRS=$(gh api -X GET --paginate "repos/$REPO/pulls" -f state=open -f base="$DEFAULT_BRANCH" \
+            -f head="${REPO%%/*}:$BRANCH" -f per_page=100 \
+            --jq '.[] | [.number, (.head.repo.full_name // ""), .head.ref, .user.login] | @tsv'); then
+            fail "Could not list the open pull requests of $REPO. Nothing was changed."
+          fi
+          OPEN=()
+          while IFS=$'\t' read -r number head_repo head_ref login; do
+            if [ -n "$number" ] && [ "$head_repo" = "$REPO" ] && [ "$head_ref" = "$BRANCH" ]; then
+              OPEN+=("$number $login")
+            fi
+          done <<<"$PRS"
+          if [ "${#OPEN[@]}" -gt 1 ]; then
+            fail "$BRANCH has ${#OPEN[@]} open pull requests (${OPEN[*]}). Nothing was changed; it needs a human."
+          fi
+
+          NUMBER=""
+          PUSH=true
+          if [ "${#OPEN[@]}" -eq 1 ]; then
+            read -r NUMBER login <<<"${OPEN[0]}"
+            if [ "$login" != "$BOT_NAME" ]; then
+              fail "$BRANCH has an open pull request (#$NUMBER) opened by $login, not by this workflow: release-on-merge would refuse it. Nothing was changed; close it and re-run."
+            fi
+            if [ -z "$OBSERVED" ]; then
+              fail "Pull request #$NUMBER is open but $BRANCH is gone. Nothing was changed; close it and re-run."
+            fi
+            # Up to date means exactly this bump on exactly this commit: one parent, $BASE_SHA,
+            # the same tree, and authored and committed by $BOT_NAME <$BOT_EMAIL>, the identity
+            # release-on-merge requires. Anything else (the default branch moved on, "Update
+            # branch" added a merge, someone pushed or recommitted the bump as themselves) is
+            # replaced by this bump, so the branch holds the one bot commit release-on-merge
+            # accepts.
+            if ! HEAD_INFO=$(gh api "repos/$REPO/commits/$OBSERVED" --jq '[(.parents | map(.sha) | join(",")), .commit.tree.sha, .commit.author.name, .commit.author.email, .commit.committer.name, .commit.committer.email] | map(. // "") | @tsv'); then
+              fail "Could not read $BRANCH's head $OBSERVED. Nothing was changed."
+            fi
+            IFS=$'\t' read -r head_parents head_tree author_name author_email committer_name committer_email <<<"$HEAD_INFO"
+            if [ "$head_parents" = "$BASE_SHA" ] && [ "$head_tree" = "$TREE" ] \
+              && [ "$author_name" = "$BOT_NAME" ] && [ "$author_email" = "$BOT_EMAIL" ] \
+              && [ "$committer_name" = "$BOT_NAME" ] && [ "$committer_email" = "$BOT_EMAIL" ]; then
+              PUSH=false
+              echo "Pull request #$NUMBER on $BRANCH is this bump on $BASE_SHA: reusing it."
+            else
+              echo "Pull request #$NUMBER on $BRANCH is not this bump (head $OBSERVED on $head_parents, by $author_name <$author_email> / $committer_name <$committer_email>): it gets this bump on $BASE_SHA."
+            fi
+          elif [ -n "$OBSERVED" ]; then
+            echo "$BRANCH exists ($OBSERVED) with no open pull request: an earlier run left it. It is recreated from this commit."
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            PLAN=()
+            if [ "$PUSH" = "true" ]; then
+              PLAN+=("push this bump to $BRANCH")
+            fi
+            if [ -z "$NUMBER" ]; then
+              PLAN+=("open a pull request into $DEFAULT_BRANCH")
+            fi
+            PLAN+=("dispatch $CI_WORKFLOW on $BRANCH")
+            echo "Dry run: would $(IFS=,; echo "${PLAN[*]}" | sed 's/,/, then /g'). Nothing was changed."
+            exit 0
+          fi
+
+          if [ "$PUSH" = "true" ]; then
+            "${SAFE_GIT[@]}" -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" \
+              commit --quiet --no-verify -m "chore(release): bump version to $VERSION"
+            # The lease is the branch as read above (empty: it must not exist), so a branch someone
+            # pushed in between is not overwritten.
+            "${SAFE_GIT[@]}" push --no-verify --force-with-lease="refs/heads/$BRANCH:$OBSERVED" \
+              origin "HEAD:refs/heads/$BRANCH"
+          fi
+
+          if [ -z "$NUMBER" ]; then
+            URL=$(gh pr create --repo "$REPO" --base "$DEFAULT_BRANCH" --head "$BRANCH" \
+              --title "chore(release): bump version to $VERSION" \
+              --body "Sets the version to $VERSION. Merge it with a merge commit once CI is green: release-on-merge then checks that it is this one bump commit, waits for CI on the merge commit, and the release workflow tags \`$TAG\` on it. Do not push to this branch or use \"Update branch\": to bring it up to date, dispatch the release workflow again.")
+            echo "Opened $URL."
+            NUMBER=${URL##*/}
+          fi
+          echo "pull_request=$NUMBER" >> "$GITHUB_OUTPUT"
+
+          gh workflow run "$CI_WORKFLOW" --repo "$REPO" --ref "$BRANCH"
+          echo "Dispatched $CI_WORKFLOW on $BRANCH for #$NUMBER."
+
+      - name: Summarize
+        if: always()
+        env:
+          VERSION: ${{ needs.bump.outputs.version }}
+          TAG: ${{ needs.bump.outputs.tag }}
+          BRANCH: ${{ steps.publish.outputs.branch }}
+          PULL_REQUEST: ${{ steps.publish.outputs.pull_request }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          {
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "# Dry run: bump to $VERSION"
+            else
+              echo "# Bump to $VERSION"
+            fi
+            echo
+            echo "- Tag on merge: $TAG"
+            echo "- Branch: ${BRANCH:-none}; pull request: ${PULL_REQUEST:+#}${PULL_REQUEST:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"

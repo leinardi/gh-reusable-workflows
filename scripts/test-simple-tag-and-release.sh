@@ -29,8 +29,11 @@
 # replaced by a stub (below) that keeps releases in a directory and creates tags
 # in a local bare "origin", which is what `git ls-remote origin` then sees.
 #
-# Needs: bash, git, yq (mikefarah v4), sha256sum, curl (only if svu is not on
-# PATH: it is then downloaded and checked exactly like the workflow does).
+# The version itself is resolved by the release-version action of
+# leinardi/gh-composite-actions, whose own tests cover it; here the version is
+# passed to the later steps as that action would output it.
+#
+# Needs: bash, git, yq (mikefarah v4), sha256sum.
 
 set -euo pipefail
 
@@ -43,30 +46,22 @@ trap 'rm -rf "$WORK"' EXIT
 wf() { yq -r "$1" "$WORKFLOW"; }
 step_run() { wf ".jobs.release.steps[] | select(.id == \"$1\") | .run" >"$WORK/$1.sh"; }
 
-RELEASE_TAG_REGEX=$(wf '.jobs.release.env.RELEASE_TAG_REGEX')
-export RELEASE_TAG_REGEX
-step_run version
+step_run input
 step_run reconcile
 step_run aliases
-
-# svu, from the same pinned archive and checksum as the workflow.
-if ! command -v svu >/dev/null 2>&1; then
-	SVU_VERSION=$(wf '.jobs.release.env.SVU_VERSION')
-	SVU_ARCHIVE=$(wf '.jobs.release.env.SVU_ARCHIVE')
-	SVU_SHA256=$(wf '.jobs.release.env.SVU_SHA256')
-	mkdir -p "$WORK/svu"
-	curl -fsSL --retry 3 -o "$WORK/svu/$SVU_ARCHIVE" \
-		"https://github.com/caarlos0/svu/releases/download/v${SVU_VERSION}/${SVU_ARCHIVE}"
-	echo "$SVU_SHA256  $WORK/svu/$SVU_ARCHIVE" | sha256sum --check --strict --quiet
-	tar -xzf "$WORK/svu/$SVU_ARCHIVE" -C "$WORK/svu" svu
-	PATH="$WORK/svu:$PATH"
-fi
+for step in input reconcile aliases; do
+	if [ ! -s "$WORK/$step.sh" ]; then
+		echo "no step with id '$step' in $WORKFLOW" >&2
+		exit 1
+	fi
+done
 
 # The gh stub. State lives under $GH_STUB_DIR:
 #   releases/<tag>/draft   "true" or "false"
 #   releases/<tag>/target  the target commit
 #   releases/<tag>/assets/ the uploaded files
 #   latest                 the tag carrying the Latest badge
+#   latest_fail            if present, reading the Latest release fails with it
 #   calls                  one line per invocation
 mkdir -p "$WORK/bin"
 cat >"$WORK/bin/gh" <<'STUB'
@@ -130,7 +125,14 @@ case "$1 $2" in
 "api repos/"*)
 	path=$2
 	case "$path" in
-	*/releases/latest) [ -s "$GH_STUB_DIR/latest" ] || exit 1; cat "$GH_STUB_DIR/latest" ;;
+	*/releases/latest)
+		if [ -e "$GH_STUB_DIR/latest_fail" ]; then
+			cat "$GH_STUB_DIR/latest_fail" >&2
+			exit 1
+		fi
+		[ -s "$GH_STUB_DIR/latest" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+		cat "$GH_STUB_DIR/latest"
+		;;
 	*/git/ref/tags/*) git -C "$GH_STUB_ORIGIN" rev-parse -q --verify "refs/tags/${path##*/}" >/dev/null ;;
 	*) echo "unexpected gh api $*" >&2; exit 1 ;;
 	esac
@@ -206,110 +208,61 @@ run_step() {
 }
 out() { sed -n "s/^$1=//p" <<<"$OUTPUT"; }
 
-resolve() { run_step version INPUT_VERSION="${1:-}" INPUT_SEMVER="${2:-}"; }
-expect_version() {
+pick() { run_step input INPUT_VERSION="${1:-}" INPUT_SEMVER="${2:-}" TAG_PREFIX="${3-v}"; }
+expect_pick() {
 	local name=$1 want=$2
-	if [ "$STATUS" -eq 0 ] && [ "$(out version)" = "$want" ]; then ok "$name"; else not_ok "$name (want $want, status $STATUS, got '$(out version)')" "$LOG"; fi
+	if [ "$STATUS" -eq 0 ] && [ "$(out version)" = "$want" ]; then ok "$name"; else not_ok "$name (want '$want', status $STATUS, got '$(out version)')" "$LOG"; fi
 }
 expect_fail() {
 	local name=$1 pattern=$2
 	if [ "$STATUS" -ne 0 ] && grep -q -- "$pattern" <<<"$LOG"; then ok "$name"; else not_ok "$name (want a failure matching '$pattern', status $STATUS)" "$LOG"; fi
 }
+# The tag regex the input step builds for prefix $1.
+regex_for() {
+	pick "" "" "$1"
+	[ "$STATUS" -eq 0 ] || { not_ok "the input step accepts the prefix '$1'" "$LOG"; return 1; }
+	out tag_regex
+}
+# matches REGEX TAG: whether the tag is a release tag under the regex, the way
+# the step scripts test it (grep -E).
+matches() { grep -qE "$1" <<<"$2"; }
 
-echo "# resolve"
+echo "# input"
 
 new_repo
-release_tag v1.2.0
-commit "fix(core): a fix"
-resolve "1.2.1" "v1.2.1"
-expect_version "semver and version that normalize equal are accepted" v1.2.1
-resolve "1.2.1" "1.2.2"
+pick "1.2.1" "v1.2.1"
+expect_pick "semver and version that normalize equal are accepted" "1.2.1"
+pick "1.2.1" "1.2.2"
 expect_fail "conflicting semver and version fail" "they differ"
-resolve "" "1.2.1"
-expect_version "the deprecated semver alone still works" v1.2.1
-for bad in 1.2 v01.2.3 1.2.3-rc.1 1.2.3+meta x1.2.3; do
-	resolve "$bad"
-	expect_fail "malformed version '$bad' fails" "must be X.Y.Z"
+pick "" "1.2.1"
+expect_pick "the deprecated semver alone still works" "1.2.1"
+pick "v1.2.1" ""
+expect_pick "version alone is passed on as given" "v1.2.1"
+pick "" ""
+expect_pick "no version and no semver: derive" ""
+pick "foo--v1.2.1" "1.2.1" "foo--v"
+expect_pick "semver and a prefixed version that normalize equal are accepted" "foo--v1.2.1"
+pick "foo--v1.2.1" "v1.2.2" "foo--v"
+expect_fail "conflicting prefixed version and semver fail" "they differ"
+for bad in "" "a b" 'v$' "v*" "x;y" "v\\"; do
+	pick "" "" "$bad"
+	expect_fail "the tag prefix '$bad' is refused" "tag_prefix"
 done
-resolve "1.1.9"
-expect_fail "a lower version fails" "lower than the latest release"
-resolve "1.2.0"
-expect_fail "the latest version, not on HEAD, fails" "already released"
-resolve ""
-expect_version "fix derives a patch" v1.2.1
-if [ "$(out explicit)" = "false" ] && [ "$(out previous)" = "v1.2.0" ] && [ "$(out major)" = "v1" ]; then ok "derived outputs"; else not_ok "derived outputs" "$OUTPUT"; fi
 
-new_repo
-resolve ""
-expect_fail "no base tag and no version fails" "nothing to derive a version from"
-resolve "0.1.0"
-expect_version "no base tag with an explicit version works" v0.1.0
-
-new_repo
-release_tag v1.2.0
-commit "feat(api): a feature"
-resolve ""
-expect_version "feat derives a minor" v1.3.0
-commit "feat(api)!: a breaking change"
-resolve ""
-expect_version "a breaking change derives a major" v2.0.0
-
-new_repo
-release_tag v1.2.0
-commit "chore(deps): bump something"
-commit "docs(readme): words"
-resolve ""
-expect_fail "only chore/docs commits: nothing to bump" "nothing to bump"
-
-new_repo
-release_tag v1.2.0
-git -C "$REPO" tag v1.9.0-rc.1
-git -C "$REPO" tag latest
-git -C "$REPO" tag v1
-commit "fix(core): a fix"
-resolve ""
-expect_version "stray non-release tags are ignored" v1.2.1
-
-new_repo
-release_tag v1.2.0
-commit "fix(core): a fix"
-release_tag v1.2.1
-resolve ""
-expect_version "a derived re-run with the tag on HEAD is a recovery" v1.2.1
-if [ "$(out recovery)" = "true" ] && [ "$(out previous)" = "v1.2.0" ]; then ok "recovery outputs"; else not_ok "recovery outputs" "$OUTPUT"; fi
-resolve "1.2.1"
-expect_version "an explicit re-run with the tag on HEAD is a recovery" v1.2.1
-
-new_repo
-release_tag v1.2.0
-commit "fix(core): the old fix"
-OLD=$(git -C "$REPO" rev-parse HEAD)
-release_tag v1.2.1
-commit "feat(api): newer"
-release_tag v1.3.0
-git -C "$REPO" checkout -q "$OLD"
-resolve "1.2.1"
-expect_version "recovering an older release on its own commit works" v1.2.1
-resolve "1.2.2"
-expect_fail "a new lower version is still refused" "lower than the latest release"
-
-new_repo
-release_tag v1.5.1
-commit "feat(core): the feature"
-OFF=$(git -C "$REPO" rev-parse HEAD)
-git -C "$REPO" reset -q --hard HEAD~1
-release_tag v1.6.0 "$OFF"
-commit "feat(core): the feature, landed again"
-resolve ""
-expect_fail "a derived version equal to a release tagged off the branch names the cause" "not in this branch's history, so the version was derived from v1.5.1"
-git -C "$REPO" reset -q --hard HEAD~1
-commit "fix(core): the change, landed again as a fix"
-resolve ""
-expect_fail "a derived version below a release tagged off the branch names the cause" "not in this branch's history, so the version was derived from v1.5.1"
-resolve "1.5.2"
-if ! grep -q "not in this branch's history" <<<"$LOG"; then ok "an explicit lower version gets no off-branch hint"; else not_ok "an explicit lower version gets no off-branch hint" "$LOG"; fi
-resolve "1.6.1"
-expect_version "an explicit version above the off-branch release works" v1.6.1
+V_REGEX=$(regex_for v)
+for good in v0.0.0 v1.2.3 v10.20.30; do
+	if matches "$V_REGEX" "$good"; then ok "prefix v: $good is a release tag"; else not_ok "prefix v: $good is a release tag" "$V_REGEX"; fi
+done
+for bad in v1 latest v01.2.3 v1.2.3-rc.1 v1.2.3+meta 1.2.3 xv1.2.3 foo--v1.2.3 v1.2.3x; do
+	if ! matches "$V_REGEX" "$bad"; then ok "prefix v: $bad is not a release tag"; else not_ok "prefix v: $bad is not a release tag" "$V_REGEX"; fi
+done
+P_REGEX=$(regex_for my.plugin--v)
+if matches "$P_REGEX" my.plugin--v1.2.3; then ok "prefix my.plugin--v: its own tag matches"; else not_ok "prefix my.plugin--v: its own tag matches" "$P_REGEX"; fi
+for bad in myXplugin--v1.2.3 v1.2.3 my.plugin--v1 my.plugin--v1.2.3-rc.1; do
+	if ! matches "$P_REGEX" "$bad"; then ok "prefix my.plugin--v: $bad is not a release tag (dots are literal)"; else not_ok "prefix my.plugin--v: $bad is not a release tag" "$P_REGEX"; fi
+done
+S_REGEX=$(regex_for pkg/v)
+if matches "$S_REGEX" pkg/v1.2.3 && ! matches "$S_REGEX" v1.2.3; then ok "prefix pkg/v: only pkg/vX.Y.Z matches"; else not_ok "prefix pkg/v: only pkg/vX.Y.Z matches" "$S_REGEX"; fi
 
 echo "# reconcile"
 
@@ -319,7 +272,8 @@ echo one >"$ASSETS/a.zip"
 echo two >"$ASSETS/b.txt"
 
 reconcile() {
-	run_step reconcile VERSION="$1" TARGET="$(git -C "$REPO" rev-parse HEAD)" ASSETS_DIR="${2:-}" DRY_RUN="${3:-false}" REPO=leinardi/test
+	run_step reconcile VERSION="$1" TARGET="$(git -C "$REPO" rev-parse HEAD)" ASSETS_DIR="${2:-}" DRY_RUN="${3:-false}" REPO=leinardi/test \
+		RELEASE_TAG_REGEX="${REGEX:-$V_REGEX}"
 }
 calls() { cat "$GH_STUB_DIR/calls"; }
 writes() { grep -E '^release (create|upload|edit)|^api -X' "$GH_STUB_DIR/calls" || true; }
@@ -435,10 +389,95 @@ echo deep >"$NESTED_ASSETS/sub/b.zip"
 reconcile v1.2.1 "$NESTED_ASSETS"
 if [ "$STATUS" -ne 0 ] && grep -q "not a top-level file" <<<"$LOG" && [ -z "$(writes)" ]; then ok "a nested artifact fails before any write"; else not_ok "a nested artifact fails before any write" "$LOG$(calls)"; fi
 
+echo "# reconcile: Latest badge"
+
+new_repo
+release_tag v1.2.0
+commit "fix(core): a fix"
+push_head
+reconcile v1.2.1
+if [ "$STATUS" -eq 0 ] && [ "$(cat "$GH_STUB_DIR/latest")" = v1.2.1 ]; then
+	ok "no release carries Latest yet (HTTP 404): the new highest takes it"
+else
+	not_ok "no release carries Latest yet (HTTP 404): the new highest takes it" "$LOG$(calls)"
+fi
+
+for err in "HTTP 502: Bad Gateway" "HTTP 403: API rate limit exceeded" "HTTP 401: Bad credentials"; do
+	new_repo
+	release_tag v1.2.0
+	commit "fix(core): a fix"
+	push_head
+	echo "gh: $err" >"$GH_STUB_DIR/latest_fail"
+	reconcile v1.2.1
+	expect_fail "reading the Latest release fails with '$err': the step fails, not 'none'" "Could not read which release carries the Latest badge"
+	rm "$GH_STUB_DIR/latest_fail"
+	: >"$GH_STUB_DIR/calls"
+	reconcile v1.2.1
+	if [ "$STATUS" -eq 0 ] && [ "$(cat "$GH_STUB_DIR/latest")" = v1.2.1 ] && ! grep -q '^release create' "$GH_STUB_DIR/calls"; then
+		ok "after '$err', a re-run finishes the badge without re-creating the release"
+	else
+		not_ok "after '$err', a re-run finishes the badge without re-creating the release" "$LOG$(calls)"
+	fi
+done
+
+echo "# reconcile: tag prefix"
+
+new_repo
+REGEX=$(regex_for gtk-rs-skills--v)
+release_tag gtk-rs-skills--v0.1.0
+release_tag v9.9.9
+commit "fix(core): a fix"
+push_head
+echo v9.9.9 >"$GH_STUB_DIR/latest"
+reconcile gtk-rs-skills--v0.1.1
+if [ "$STATUS" -eq 0 ] && [ "$(remote_tag gtk-rs-skills--v0.1.1)" = "$(git -C "$REPO" rev-parse HEAD)" ] \
+	&& [ "$(out is_latest)" = true ] && grep -q -- '--title gtk-rs-skills--v0.1.1' "$GH_STUB_DIR/calls"; then
+	ok "a prefixed release is the highest of its prefix: another prefix's higher tag does not count"
+else
+	not_ok "a prefixed release is the highest of its prefix: another prefix's higher tag does not count" "$LOG$(calls)"
+fi
+unset REGEX
+
+new_repo
+REGEX=$(regex_for gtk-rs-skills--v)
+release_tag gtk-rs-skills--v0.2.0
+commit "fix(core): an old fix"
+push_head
+git -C "$REPO" tag gtk-rs-skills--v0.1.0 HEAD~1
+git -C "$REPO" push -q origin refs/tags/gtk-rs-skills--v0.1.0
+echo gtk-rs-skills--v0.2.0 >"$GH_STUB_DIR/latest"
+reconcile gtk-rs-skills--v0.1.1
+if [ "$STATUS" -eq 0 ] && [ "$(out is_latest)" = false ] && [ "$(cat "$GH_STUB_DIR/latest")" = gtk-rs-skills--v0.2.0 ]; then
+	ok "a prefixed release below its prefix's highest does not take Latest"
+else
+	not_ok "a prefixed release below its prefix's highest does not take Latest" "$LOG$(calls)"
+fi
+unset REGEX
+
+new_repo
+REGEX=$(regex_for pkg/v)
+release_tag pkg/v1.9.0
+commit "fix(core): a fix"
+push_head
+reconcile pkg/v1.10.0
+if [ "$STATUS" -eq 0 ] && [ "$(out is_latest)" = true ] && [ "$(remote_tag pkg/v1.10.0)" = "$(git -C "$REPO" rev-parse HEAD)" ]; then
+	ok "a prefix with a slash: tag names are read whole, and 1.10.0 sorts above 1.9.0"
+else
+	not_ok "a prefix with a slash: tag names are read whole, and 1.10.0 sorts above 1.9.0" "$LOG$(calls)"
+fi
+reconcile pkg/v1.9.1
+if [ "$STATUS" -eq 0 ] && [ "$(out is_latest)" = false ]; then
+	ok "a prefix with a slash: a lower version is not latest"
+else
+	not_ok "a prefix with a slash: a lower version is not latest" "$LOG$(calls)"
+fi
+unset REGEX
+
 echo "# aliases"
 
 aliases() {
-	run_step aliases VERSION="$1" MAJOR="$2" TARGET="$(git -C "$REPO" rev-parse HEAD)" REPO=leinardi/test
+	run_step aliases VERSION="$1" MAJOR="$2" TARGET="$(git -C "$REPO" rev-parse HEAD)" REPO=leinardi/test \
+		TAG_PREFIX="${PREFIX:-v}" RELEASE_TAG_REGEX="${REGEX:-$V_REGEX}"
 }
 
 new_repo
@@ -489,6 +528,65 @@ if [ "$STATUS" -eq 0 ] && [ "$(remote_tag v1)" = "$(git -C "$REPO" rev-parse HEA
 	ok "a v1 backport under v2 moves v1 only (and creates it)"
 else
 	not_ok "a v1 backport under v2 moves v1 only (and creates it)" "$LOG$(calls)"
+fi
+
+
+new_repo
+release_tag v1.2.0
+git -C "$ORIGIN" tag v1 "$(git -C "$REPO" rev-parse HEAD)"
+commit "fix(core): a fix"
+release_tag v1.2.1
+aliases v1.2.1 v1
+if [ "$STATUS" -eq 0 ] && grep -q '^api -X PATCH repos/leinardi/test/git/refs/tags/v1 ' "$GH_STUB_DIR/calls" \
+	&& grep -q '^api -X POST repos/leinardi/test/git/refs ' "$GH_STUB_DIR/calls" \
+	&& ! grep -q '^api repos/leinardi/test/git/ref/' "$GH_STUB_DIR/calls"; then
+	ok "an existing moving tag is updated and a missing one created, decided from the listing"
+else
+	not_ok "an existing moving tag is updated and a missing one created, decided from the listing" "$LOG$(calls)"
+fi
+
+new_repo
+release_tag v1.2.0
+git -C "$ORIGIN" tag v1 "$(git -C "$REPO" rev-parse HEAD)"
+commit "fix(core): a fix"
+release_tag v1.10.0
+release_tag v10.0.0 HEAD~1
+git -C "$ORIGIN" tag v10 "$(git -C "$REPO" rev-parse HEAD~1)"
+aliases v1.10.0 v1
+if [ "$STATUS" -eq 0 ] && [ "$(remote_tag v1)" = "$(git -C "$REPO" rev-parse HEAD)" ] \
+	&& [ "$(remote_tag v10)" = "$(git -C "$REPO" rev-parse HEAD~1)" ] \
+	&& [ "$(remote_tag latest)" = "" ]; then
+	ok "v1.10.0 is the highest v1 release, v10.0.0 is not a v1 release, and latest stays with v10.0.0"
+else
+	not_ok "v1.10.0 is the highest v1 release, v10.0.0 is not a v1 release, and latest stays with v10.0.0" "$LOG$(calls)"
+fi
+
+new_repo
+PREFIX=gtk-rs-skills--v
+REGEX=$(regex_for "$PREFIX")
+release_tag gtk-rs-skills--v0.1.0
+commit "fix(core): a fix"
+release_tag gtk-rs-skills--v0.1.1
+aliases gtk-rs-skills--v0.1.1 gtk-rs-skills--v0
+if [ "$STATUS" -eq 0 ] && [ -z "$(writes)" ] && [ -z "$(remote_tag latest)" ] && [ -z "$(remote_tag gtk-rs-skills--v0)" ] \
+	&& [ -z "$(out moved)" ] && grep -q "no vMAJOR or latest tag is moved" <<<"$LOG"; then
+	ok "a prefix other than v moves no tag at all"
+else
+	not_ok "a prefix other than v moves no tag at all" "$LOG$(calls)"
+fi
+unset PREFIX REGEX
+
+new_repo
+release_tag v1.2.0
+git -C "$ORIGIN" tag latest "$(git -C "$REPO" rev-parse HEAD)"
+release_tag plugin--v5.0.0
+commit "fix(core): a fix"
+release_tag v1.2.1
+aliases v1.2.1 v1
+if [ "$STATUS" -eq 0 ] && [ "$(remote_tag latest)" = "$(git -C "$REPO" rev-parse HEAD)" ]; then
+	ok "prefix v: another prefix's higher tag does not keep latest"
+else
+	not_ok "prefix v: another prefix's higher tag does not keep latest" "$LOG$(calls)"
 fi
 
 echo

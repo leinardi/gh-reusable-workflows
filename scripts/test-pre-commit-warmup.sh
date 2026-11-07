@@ -22,64 +22,48 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-# Tests the prune step of .github/workflows/pre-commit-warmup.yaml.
+# Tests .github/workflows/pre-commit-warmup.yaml.
 #
-# The script is extracted from the workflow with yq, so what is tested is exactly what the workflow
-# runs. `gh` is replaced by a stub (below) that serves a fixed cache list through the real jq,
-# records every call, and fails the way the GitHub API does when asked to.
+# The install step's script is extracted with yq and run with stub `python` and `pre-commit`
+# commands, so what is tested is exactly what the workflow runs. The cache key and the prune call
+# are checked as written in the workflow, against the key format the callers' CI must restore and
+# against this repository's own CI (local-ci.yaml), which restores it. The prune itself is the
+# prune-caches action of leinardi/gh-composite-actions, tested there.
 #
-# Needs: bash, yq (mikefarah v4), jq.
+# Needs: bash, yq (mikefarah v4).
 
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WORKFLOW="$ROOT/.github/workflows/pre-commit-warmup.yaml"
+LOCAL_CI="$ROOT/.github/workflows/local-ci.yaml"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-yq -r '.jobs.prune.steps[] | select(.id == "prune") | .run' "$WORKFLOW" >"$WORK/prune.sh"
-if [ ! -s "$WORK/prune.sh" ]; then
-	echo "no step with id 'prune' in $WORKFLOW" >&2
+wf() { yq -r "$1" "$WORKFLOW"; }
+step() { wf ".jobs[\"$1\"].steps[] | select(.id == \"$2\") | $3"; }
+ci_step() { yq -r ".jobs[\"pre-commit-all\"].steps[] | select($1) | $2" "$LOCAL_CI"; }
+
+step warm-pre-commit-cache install .run >"$WORK/install.sh"
+if [ ! -s "$WORK/install.sh" ]; then
+	echo "no step with id 'install' in $WORKFLOW" >&2
 	exit 1
 fi
 
-# The gh stub. State lives under $GH_STUB_DIR:
-#   caches     the JSON array `gh cache list --json id` returns, newest first
-#   list_fail  if present, `gh cache list` fails with its content on stderr
-#   del_fail   if present, `gh cache delete` fails with its content on stderr
-#   calls      one line per invocation
+# Stubs: `python -m pip ...` and `pre-commit --version` record their arguments.
 mkdir -p "$WORK/bin"
-cat >"$WORK/bin/gh" <<'STUB'
+cat >"$WORK/bin/python" <<'STUB'
 #!/usr/bin/env bash
-set -euo pipefail
-echo "$*" >>"$GH_STUB_DIR/calls"
-case "$1 $2" in
-"cache list")
-	if [ -e "$GH_STUB_DIR/list_fail" ]; then
-		cat "$GH_STUB_DIR/list_fail" >&2
-		exit 1
-	fi
-	expr=""
-	while [ "$#" -gt 0 ]; do
-		case "$1" in
-		--jq) expr=$2; shift 2 ;;
-		*) shift ;;
-		esac
-	done
-	jq -r "$expr" "$GH_STUB_DIR/caches"
-	;;
-"cache delete")
-	if [ -e "$GH_STUB_DIR/del_fail" ]; then
-		cat "$GH_STUB_DIR/del_fail" >&2
-		exit 1
-	fi
-	;;
-*) echo "unexpected gh $*" >&2; exit 1 ;;
-esac
+echo "python $*" >>"$STUB_CALLS"
 STUB
-chmod +x "$WORK/bin/gh"
+cat >"$WORK/bin/pre-commit" <<'STUB'
+#!/usr/bin/env bash
+echo "pre-commit $*" >>"$STUB_CALLS"
+STUB
+chmod +x "$WORK/bin/python" "$WORK/bin/pre-commit"
 PATH="$WORK/bin:$PATH"
+export STUB_CALLS="$WORK/calls"
 
 PASS=0
 FAIL=0
@@ -90,114 +74,80 @@ ok() {
 not_ok() {
 	FAIL=$((FAIL + 1))
 	echo "FAIL - $1"
-	printf '%s\n' "$2" | sed 's/^/       /'
+	printf '%s\n' "${2:-}" | sed 's/^/       /'
 }
-
-# A fresh stub state with caches 5 (newest) down to 1 (oldest).
-reset() {
-	export GH_STUB_DIR="$WORK/state"
-	rm -rf "$GH_STUB_DIR"
-	mkdir -p "$GH_STUB_DIR"
-	echo '[{"id":5},{"id":4},{"id":3},{"id":2},{"id":1}]' >"$GH_STUB_DIR/caches"
-	: >"$GH_STUB_DIR/calls"
-}
-
-# prune KEEP: runs the step as the workflow would; sets STATUS and LOG.
-prune() {
-	STATUS=0
-	LOG=$(env GH_REPO=owner/repo CACHE_REF=refs/heads/main KEY_PREFIX=pre-commit KEEP="$1" \
-		bash "$WORK/prune.sh" 2>&1) || STATUS=$?
-}
-deleted() { sed -n 's/^cache delete //p' "$GH_STUB_DIR/calls" | tr '\n' ' '; }
-fails() {
-	not_ok "$1" "status=$STATUS deleted=[$(deleted)]
-$LOG
-$(cat "$GH_STUB_DIR/calls")"
-}
-
-reset
-prune 2
-if [ "$STATUS" -eq 0 ] && [ "$(deleted)" = "3 2 1 " ]; then
-	ok "keeps the newest two and deletes the rest"
-else
-	fails "keeps the newest two and deletes the rest"
-fi
-if grep -q -- "--ref refs/heads/main --key pre-commit| --sort created_at --order desc" "$GH_STUB_DIR/calls"; then
-	ok "lists only the calling ref, under the key prefix and its separator"
-else
-	fails "lists only the calling ref, under the key prefix and its separator"
-fi
-
-reset
-prune 5
-if [ "$STATUS" -eq 0 ] && [ -z "$(deleted)" ] && grep -q "Nothing to prune" <<<"$LOG"; then
-	ok "deletes nothing when there are no more caches than it keeps"
-else
-	fails "deletes nothing when there are no more caches than it keeps"
-fi
-
-reset
-prune 1
-if [ "$STATUS" -eq 0 ] && [ "$(deleted)" = "4 3 2 1 " ]; then
-	ok "keep_caches 1 keeps only the newest"
-else
-	fails "keep_caches 1 keeps only the newest"
-fi
-
-for bad in 0 -1 abc 1.5 ""; do
-	reset
-	prune "$bad"
-	if [ "$STATUS" -ne 0 ] && [ ! -s "$GH_STUB_DIR/calls" ] && grep -q "::error" <<<"$LOG"; then
-		ok "keep_caches '$bad' fails before calling gh"
+check() {
+	local name=$1 got=$2 want=$3
+	if [ "$got" = "$want" ]; then
+		ok "$name"
 	else
-		fails "keep_caches '$bad' fails before calling gh"
+		not_ok "$name" "want: $want
+got:  $got"
+	fi
+}
+
+install() {
+	: >"$STUB_CALLS"
+	STATUS=0
+	LOG=$(env PRE_COMMIT_VERSION="$1" bash "$WORK/install.sh" 2>&1) || STATUS=$?
+}
+
+echo "# install"
+
+install 4.6.2
+if [ "$STATUS" -eq 0 ] && grep -qxF "python -m pip install --disable-pip-version-check --no-cache-dir pre-commit==4.6.2" "$STUB_CALLS"; then
+	ok "installs exactly the pinned pre-commit"
+else
+	not_ok "installs exactly the pinned pre-commit" "$LOG
+$(cat "$STUB_CALLS")"
+fi
+
+for bad in "" 4.6 4.6.2.1 v4.6.2 "4.6.2 --index-url=https://example.invalid" ">=4" 04.6.2 4.6.2rc1; do
+	install "$bad"
+	if [ "$STATUS" -ne 0 ] && [ ! -s "$STUB_CALLS" ] && grep -q "::error" <<<"$LOG"; then
+		ok "pre_commit_version '$bad' fails before pip runs"
+	else
+		not_ok "pre_commit_version '$bad' fails before pip runs" "$LOG
+$(cat "$STUB_CALLS")"
 	fi
 done
 
-reset
-echo "X Failed to get caches: HTTP 403: Resource not accessible by integration" >"$GH_STUB_DIR/list_fail"
-prune 2
-if [ "$STATUS" -eq 0 ] && [ -z "$(deleted)" ] && grep -q "^::warning" <<<"$LOG"; then
-	ok "a caller without actions permissions gets a warning and a skipped prune"
-else
-	fails "a caller without actions permissions gets a warning and a skipped prune"
-fi
+echo "# defaults"
 
-reset
-echo "X Failed to delete cache: HTTP 403: Resource not accessible by integration" >"$GH_STUB_DIR/del_fail"
-prune 2
-if [ "$STATUS" -eq 0 ] && [ "$(deleted)" = "3 " ] && grep -q "^::warning" <<<"$LOG"; then
-	ok "a caller with actions: read only gets a warning after the first refused delete"
-else
-	fails "a caller with actions: read only gets a warning after the first refused delete"
-fi
+DEFAULT_PRE_COMMIT=$(wf '.on.workflow_call.inputs.pre_commit_version.default')
+check "pre_commit_version defaults to the version template-default's CI pins" "$DEFAULT_PRE_COMMIT" "4.6.2"
+check "local-ci installs the warm-up's default pre-commit" \
+	"$(ci_step '.name == "Install pre-commit"' .run)" "pip install --no-cache-dir pre-commit==$DEFAULT_PRE_COMMIT"
+check "local-ci sets up the warm-up's default Python" \
+	"$(ci_step '.id == "python"' '.with["python-version"]')" "$(wf '.on.workflow_call.inputs.python_version.default')"
 
-reset
-echo "X Could not find a cache matching 3 in owner/repo" >"$GH_STUB_DIR/del_fail"
-prune 2
-if [ "$STATUS" -eq 0 ] && [ "$(deleted)" = "3 2 1 " ]; then
-	ok "a cache another run already deleted is not an error"
-else
-	fails "a cache another run already deleted is not an error"
-fi
+echo "# cache key"
 
-reset
-echo "X Failed to get caches: HTTP 502: Bad Gateway" >"$GH_STUB_DIR/list_fail"
-prune 2
-if [ "$STATUS" -ne 0 ] && grep -q "HTTP 502" <<<"$LOG"; then
-	ok "any other list error fails the job"
-else
-	fails "any other list error fails the job"
-fi
+# The documented format, as a caller's CI writes it (the warm-up's prefix is an input).
+KEY_FORMAT="\${{ inputs.cache_key_prefix }}|\${{ runner.os }}|\${{ steps.python.outputs.python-version }}|\${{ hashFiles('.pre-commit-config.yaml') }}"
+check "the key is <prefix>|<os>|<resolved python>|<config hash>" "$(step warm-pre-commit-cache key .env.KEY)" "$KEY_FORMAT"
+check "the resolved Python comes from a setup-python step with id 'python'" \
+	"$(step warm-pre-commit-cache python '.uses | sub(" .*"; "") | sub("@.*"; "")')" "actions/setup-python"
+check "the cache is saved under that key" "$(step warm-pre-commit-cache precommit '.with.key')" "\${{ steps.key.outputs.key }}"
+check "local-ci restores the same setup-python as the warm-up" \
+	"$(ci_step '.id == "python"' .uses)" "$(step warm-pre-commit-cache python .uses)"
+DEFAULT_PREFIX=$(wf '.on.workflow_call.inputs.cache_key_prefix.default')
+check "local-ci restores the warm-up's key, with the default prefix" \
+	"$(ci_step '.name == "Restore the pre-commit cache"' .with.key)" \
+	"${KEY_FORMAT/"\${{ inputs.cache_key_prefix }}"/$DEFAULT_PREFIX}"
 
-reset
-echo "X Failed to delete cache: HTTP 500: Internal Server Error" >"$GH_STUB_DIR/del_fail"
-prune 2
-if [ "$STATUS" -ne 0 ] && grep -q "HTTP 500" <<<"$LOG"; then
-	ok "any other delete error fails the job"
-else
-	fails "any other delete error fails the job"
-fi
+echo "# prune"
+
+PRUNE_STEP='.jobs.prune.steps[0]'
+check "the prune is the pinned prune-caches action" \
+	"$(wf "$PRUNE_STEP.uses")" "leinardi/gh-composite-actions/prune-caches@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa"
+check "the prune deletes under the key prefix and its separator only" \
+	"$(wf "$PRUNE_STEP.with[\"key-prefix\"]")" "\${{ inputs.cache_key_prefix }}|"
+check "the prune keeps keep_caches entries" "$(wf "$PRUNE_STEP.with.keep")" "\${{ inputs.keep_caches }}"
+check "the prune touches the calling ref only" "$(wf "$PRUNE_STEP.with.ref")" "\${{ github.ref }}"
+check "the prune job declares no permissions (it runs with the calling job's grant)" \
+	"$(wf '.jobs.prune | has("permissions")')" "false"
+check "every job has a timeout" "$(wf '[.jobs[] | has("timeout-minutes")] | all')" "true"
 
 echo
 echo "$PASS passed, $FAIL failed"

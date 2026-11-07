@@ -2,22 +2,25 @@ name: Release (reusable)
 
 # Resolves a release version (explicit, or derived from the Conventional Commits
 # since the last release by svu), then reconciles the GitHub release for it:
-# draft, assets, publish, and the moving `vMAJOR` / `latest` tags. Every step is
-# idempotent, so re-running a failed run finishes what it started.
+# draft, assets, publish, and, for the default `v` prefix, the moving `vMAJOR` /
+# `latest` tags. Every step is idempotent, so re-running a failed run finishes
+# what it started.
 #
 # Release tags are immutable in the repositories that call this ("Immutable
 # tags" ruleset: no update, no deletion), so nothing here creates a tag and
 # deletes it on failure. The tag is created by publishing the draft, which is
 # the last irreversible step; everything that can fail runs before it.
 #
-# The inline scripts are tested by scripts/test-simple-tag-and-release.sh, which
-# extracts them from this file with yq. Keep each one self-contained: it reads
-# its inputs from env only.
+# The version is resolved by the release-version action of
+# leinardi/gh-composite-actions, which carries its own tests. The inline scripts
+# here are tested by scripts/test-simple-tag-and-release.sh, which extracts them
+# from this file with yq. Keep each one self-contained: it reads its inputs from
+# env only.
 on:
   workflow_call:
     inputs:
       version:
-        description: "Version, e.g. 1.2.0 or v1.2.0 (empty: derive from the commits since the last release)"
+        description: "Version, e.g. 1.2.0, v1.2.0 or <tag_prefix>1.2.0 (empty: derive from the commits since the last release)"
         type: string
         required: false
         default: ""
@@ -26,6 +29,11 @@ on:
         type: string
         required: false
         default: ""
+      tag_prefix:
+        description: "Text before X.Y.Z in a release tag: `v` for vX.Y.Z, `<plugin>--v` for <plugin>--vX.Y.Z. Only `v` moves the vMAJOR and latest tags."
+        type: string
+        required: false
+        default: "v"
       dry_run:
         description: "Resolve the version and print the plan; write nothing"
         type: boolean
@@ -38,16 +46,22 @@ on:
         default: ""
     outputs:
       version:
-        description: "The released (or, on a dry run, the resolved) version, vX.Y.Z"
+        description: "The released (or, on a dry run, the resolved) release tag, <tag_prefix>X.Y.Z: vX.Y.Z for the default prefix"
+        value: ${{ jobs.release.outputs.version }}
+      tag:
+        description: "The same release tag, <tag_prefix>X.Y.Z, under a name that says what it is"
         value: ${{ jobs.release.outputs.version }}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Creating the release and its tag, and moving vMAJOR / latest.
+    permissions:
+      contents: write
     # One release per repository at a time, never cancelled: two runs in flight
     # would both pass "higher than every released version" and could publish in
     # the wrong order.
@@ -55,17 +69,7 @@ jobs:
       group: release-${{ github.repository }}
       cancel-in-progress: false
     outputs:
-      version: ${{ steps.version.outputs.version }}
-    env:
-      # The one definition of a release tag: vMAJOR.MINOR.PATCH, strict SemVer
-      # core with no leading zeros, no pre-release and no build metadata. Every
-      # tag lookup filters through this, never through a glob.
-      RELEASE_TAG_REGEX: '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-      # Pinned by hand as one unit: version, archive and its SHA-256 (from the
-      # release's checksums.txt). Dependabot does not track a download.
-      SVU_VERSION: 3.4.1
-      SVU_ARCHIVE: svu_3.4.1_linux_amd64.tar.gz
-      SVU_SHA256: 7ee8c91998c15109130638dc661a912d5f426e2f8642f6f6c04e6502be920770
+      version: ${{ steps.resolve.outputs.tag }}
 
     steps:
       # workflow_dispatch lets the caller pick any branch. A release is cut from
@@ -88,128 +92,63 @@ jobs:
           # svu reads the tags and the commits since the last one.
           fetch-depth: 0
           fetch-tags: true
+          # Nothing is pushed with git: the release, its tag and the moving tags
+          # go through the API. The two steps that read the remote's tags get a
+          # credential of their own (GIT_CONFIG_* below).
+          persist-credentials: false
 
       - name: Install svu
-        run: |
-          set -euo pipefail
-          dir="$RUNNER_TEMP/svu"
-          mkdir -p "$dir"
-          curl -fsSL --retry 3 -o "$dir/$SVU_ARCHIVE" \
-            "https://github.com/caarlos0/svu/releases/download/v${SVU_VERSION}/${SVU_ARCHIVE}"
-          echo "$SVU_SHA256  $dir/$SVU_ARCHIVE" | sha256sum --check --strict
-          tar -xzf "$dir/$SVU_ARCHIVE" -C "$dir" svu
-          echo "$dir" >> "$GITHUB_PATH"
+        uses: leinardi/gh-composite-actions/setup-svu@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
 
-      - name: Resolve the version to release
-        id: version
+      # The release-version action knows `version` only. This keeps the
+      # deprecated `semver` alias working: the two may both be set only to the
+      # same version. It also checks the prefix and builds the one tag regex the
+      # later steps filter every tag lookup through.
+      - name: Pick the version input and the tag regex
+        id: input
         env:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_SEMVER: ${{ inputs.semver }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
         run: |
           set -euo pipefail
 
-          # Prints the highest strict release tag in its input, or nothing.
-          highest_release() {
-            { grep -E "$RELEASE_TAG_REGEX" || true; } | sort -V | tail -n1
-          }
-          # Whether the release tag $1 sits on HEAD.
-          on_head() {
-            git tag --points-at HEAD | { grep -E "$RELEASE_TAG_REGEX" || true; } | grep -qxF "$1"
-          }
-          normalize() {
-            if [ -n "$1" ]; then
-              printf 'v%s' "${1#v}"
-            fi
-          }
-
-          V=$(normalize "$INPUT_VERSION")
-          S=$(normalize "$INPUT_SEMVER")
-          if [ -n "$V" ] && [ -n "$S" ] && [ "$V" != "$S" ]; then
-            echo "Both version ($INPUT_VERSION) and the deprecated semver ($INPUT_SEMVER) are set, and they differ. Pass only version." >&2
+          # The same rule as release-version: with only these characters the
+          # prefix is literal in a regex once its dots are escaped.
+          if [ -z "$TAG_PREFIX" ] || ! [[ "$TAG_PREFIX" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "tag_prefix '$TAG_PREFIX' must be non-empty and hold only letters, digits and '.', '_', '/', '-'. Nothing was changed." >&2
             exit 1
           fi
-          RAW="${V:-$S}"
 
-          if [ -n "$RAW" ]; then
-            VERSION="$RAW"
-            if ! [[ "$VERSION" =~ $RELEASE_TAG_REGEX ]]; then
-              echo "Version must be X.Y.Z or vX.Y.Z with no leading zeros, no pre-release and no build metadata (got '$RAW')." >&2
-              exit 1
-            fi
-            EXPLICIT=true
-          else
-            # svu is given the exact tag to count from, never a glob: it matches
-            # --tag.pattern against every tag, so a pattern would let a stray tag
-            # like v1.9.0-rc.1 become the current version.
-            CURRENT=$(git tag --merged HEAD | highest_release)
-            if [ -z "$CURRENT" ]; then
-              echo "No vX.Y.Z release tag is reachable from this commit, so there is nothing to derive a version from. Re-run with an explicit version." >&2
-              exit 1
-            fi
-            VERSION=$(svu next --tag.pattern "$CURRENT")
-            if ! [[ "$VERSION" =~ $RELEASE_TAG_REGEX ]]; then
-              echo "svu derived '$VERSION' from $CURRENT, which is not a vX.Y.Z release tag." >&2
-              exit 1
-            fi
-            # svu prints the current version unchanged when no feat/fix/breaking
-            # commit exists since the last release. That is not a release, unless
-            # the tag is on HEAD itself: then this re-runs one that published
-            # the tag and failed afterwards.
-            if [ "$VERSION" = "$CURRENT" ] && ! on_head "$VERSION"; then
-              echo "No feat/fix or breaking-change commit since ${CURRENT}, so there is nothing to bump. Re-run with an explicit version to force one." >&2
-              exit 1
-            fi
-            EXPLICIT=false
-          fi
-
-          # A recovery is this exact version already on HEAD, nothing wider.
-          RECOVERY=false
-          if on_head "$VERSION"; then
-            RECOVERY=true
-          fi
-
-          if [ "$RECOVERY" = "true" ]; then
-            PREVIOUS=$({ git tag --merged "HEAD^" 2>/dev/null || true; } | highest_release)
-          else
-            PREVIOUS=$(git tag --merged HEAD | highest_release)
-          fi
-
-          # A version must be higher than every version already released, except
-          # on a recovery, which reuses the version it failed on.
-          LATEST=$(git tag --list | highest_release)
-          # A derived version counts from the highest release reachable from this
-          # commit. When the highest release overall is tagged on a commit
-          # outside this branch, that base is older: name it, so the failure
-          # explains itself.
-          off_branch_hint() {
-            if [ "$EXPLICIT" != "true" ] && ! git merge-base --is-ancestor "$LATEST" HEAD; then
-              echo "$LATEST is tagged on a commit that is not in this branch's history, so the version was derived from $CURRENT instead. Re-run with an explicit version higher than $LATEST." >&2
+          # A version input without its prefix, or without a bare leading v.
+          bare() {
+            if [[ "$1" == "$TAG_PREFIX"* ]]; then
+              printf '%s' "${1#"$TAG_PREFIX"}"
+            else
+              printf '%s' "${1#v}"
             fi
           }
-          if [ -n "$LATEST" ] && [ "$RECOVERY" != "true" ]; then
-            if [ "$VERSION" = "$LATEST" ]; then
-              echo "$VERSION is already released and does not point at this commit. Release a higher version." >&2
-              off_branch_hint
-              exit 1
-            fi
-            HIGHEST=$(printf '%s\n%s\n' "$VERSION" "$LATEST" | sort -V | tail -n1)
-            if [ "$HIGHEST" != "$VERSION" ]; then
-              echo "$VERSION is lower than the latest release $LATEST. Release tags are immutable, so only a higher version may be published." >&2
-              off_branch_hint
-              exit 1
-            fi
+          if [ -n "$INPUT_VERSION" ] && [ -n "$INPUT_SEMVER" ] \
+            && [ "$(bare "$INPUT_VERSION")" != "$(bare "$INPUT_SEMVER")" ]; then
+            echo "Both version ($INPUT_VERSION) and the deprecated semver ($INPUT_SEMVER) are set, and they differ. Pass only version. Nothing was changed." >&2
+            exit 1
           fi
 
-          MAJOR="${VERSION#v}"
-          MAJOR="v${MAJOR%%.*}"
-          echo "Resolved $VERSION (previous: ${PREVIOUS:-none}, explicit: $EXPLICIT, recovery: $RECOVERY)"
+          # <prefix>MAJOR.MINOR.PATCH, strict SemVer core with no leading zeros,
+          # no pre-release and no build metadata: the one definition of a release
+          # tag. Every tag lookup filters through this, never through a glob.
+          REGEX="^${TAG_PREFIX//./\\.}(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\$"
           {
-            echo "version=$VERSION"
-            echo "previous=$PREVIOUS"
-            echo "explicit=$EXPLICIT"
-            echo "recovery=$RECOVERY"
-            echo "major=$MAJOR"
+            echo "version=${INPUT_VERSION:-$INPUT_SEMVER}"
+            echo "tag_regex=$REGEX"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the version to release
+        id: resolve
+        uses: leinardi/gh-composite-actions/release-version@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
+        with:
+          version: ${{ steps.input.outputs.version }}
+          tag-prefix: ${{ inputs.tag_prefix }}
 
       - name: Download the release assets
         if: inputs.artifact_name != ''
@@ -227,20 +166,30 @@ jobs:
       - name: Reconcile the GitHub release
         id: reconcile
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ steps.resolve.outputs.tag }}
           TARGET: ${{ github.sha }}
+          RELEASE_TAG_REGEX: ${{ steps.input.outputs.tag_regex }}
           ASSETS_DIR: ${{ inputs.artifact_name != '' && format('{0}/release-assets', runner.temp) || '' }}
           DRY_RUN: ${{ inputs.dry_run }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          # git ls-remote of a private repository needs the token; the checkout
+          # did not persist it. Git runs this helper with the step's env.
+          GIT_TERMINAL_PROMPT: "0"
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!f() { if [ "$1" = get ]; then echo username=x-access-token; echo "password=$GH_TOKEN"; fi; }; f'
         run: |
           set -euo pipefail
+
+          # The names of the remote's tags, from `git ls-remote --tags --refs`.
+          tag_names() { awk '{ sub(/^refs\/tags\//, "", $2); print $2 }' <<<"$1"; }
 
           # The highest strict release on the remote, counting $VERSION itself.
           # Its own assignment, so a failed ls-remote stops the step instead of
           # reading as "no tags".
           REMOTE_TAGS=$(git ls-remote --tags --refs origin)
-          HIGHEST=$({ awk -F/ '{print $NF}' <<<"$REMOTE_TAGS"; echo "$VERSION"; } \
+          HIGHEST=$({ tag_names "$REMOTE_TAGS"; echo "$VERSION"; } \
             | { grep -E "$RELEASE_TAG_REGEX" || true; } | sort -V | tail -n1)
           IS_LATEST=false
           if [ "$HIGHEST" = "$VERSION" ]; then
@@ -369,8 +318,18 @@ jobs:
 
           # GitHub's "Latest" badge follows the highest release, never a recovery
           # of an older one. make_latest=false cannot take the badge away, so a
-          # wrong badge is fixed by marking the highest release instead.
-          CURRENT_LATEST=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+          # wrong badge is fixed by marking the highest release instead. Only
+          # "no latest release" (HTTP 404) reads as none; any other error fails,
+          # and a re-run finishes from here.
+          ERR=$(mktemp)
+          if ! CURRENT_LATEST=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>"$ERR"); then
+            if ! grep -q 'HTTP 404' "$ERR"; then
+              cat "$ERR" >&2
+              echo "Could not read which release carries the Latest badge. $VERSION is published; re-run to finish." >&2
+              exit 1
+            fi
+            CURRENT_LATEST=""
+          fi
           if [ "$IS_LATEST" = "true" ] && [ "$CURRENT_LATEST" != "$VERSION" ]; then
             gh release edit "$VERSION" --latest
           elif [ "$IS_LATEST" != "true" ] && [ "$CURRENT_LATEST" = "$VERSION" ]; then
@@ -382,25 +341,45 @@ jobs:
       # is not the highest overall does not take `latest`, and one that is not
       # the highest of its major does not take `vMAJOR`. Recovering an older
       # release therefore leaves both where they are.
+      #
+      # Only the default `v` prefix has moving tags. Another prefix moves none:
+      # `latest` is one tag per repository, so two prefixes would fight over it,
+      # and the "Immutable tags" ruleset exempts only `v<N>` and `latest`, so a
+      # `<prefix>MAJOR` could be created once and then never moved.
       - name: Move the major and latest tags
         id: aliases
         if: ${{ !inputs.dry_run }}
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-          MAJOR: ${{ steps.version.outputs.major }}
+          VERSION: ${{ steps.resolve.outputs.tag }}
+          MAJOR: ${{ steps.resolve.outputs.major }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
           TARGET: ${{ github.sha }}
+          RELEASE_TAG_REGEX: ${{ steps.input.outputs.tag_regex }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!f() { if [ "$1" = get ]; then echo username=x-access-token; echo "password=$GH_TOKEN"; fi; }; f'
         run: |
           set -euo pipefail
-          REMOTE_TAGS=$(git ls-remote --tags --refs origin)
-          RELEASES=$(awk -F/ '{print $NF}' <<<"$REMOTE_TAGS" | { grep -E "$RELEASE_TAG_REGEX" || true; })
-          HIGHEST=$(sort -V <<<"$RELEASES" | tail -n1)
-          HIGHEST_IN_MAJOR=$({ grep -E "^${MAJOR}\\." <<<"$RELEASES" || true; } | sort -V | tail -n1)
+          if [ "$TAG_PREFIX" != "v" ]; then
+            echo "::notice::The tag prefix is '$TAG_PREFIX', not 'v': no vMAJOR or latest tag is moved."
+            echo "moved=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          # Points refs/tags/$1 at $TARGET: update in place, or create it.
+          REMOTE_TAGS=$(git ls-remote --tags --refs origin)
+          RELEASES=$(awk '{ sub(/^refs\/tags\//, "", $2); print $2 }' <<<"$REMOTE_TAGS" \
+            | { grep -E "$RELEASE_TAG_REGEX" || true; })
+          HIGHEST=$(sort -V <<<"$RELEASES" | tail -n1)
+          HIGHEST_IN_MAJOR=$(MAJOR_DOT="$MAJOR." awk 'index($0, ENVIRON["MAJOR_DOT"]) == 1' <<<"$RELEASES" | sort -V | tail -n1)
+
+          # Points refs/tags/$1 at $TARGET: update in place, or create it. Whether
+          # it exists comes from the listing above, not from a probe whose error
+          # could read as "absent".
           move() {
-            if gh api "repos/$REPO/git/ref/tags/$1" >/dev/null 2>&1; then
+            if awk -v r="refs/tags/$1" '$2 == r { found = 1 } END { exit !found }' <<<"$REMOTE_TAGS"; then
               gh api -X PATCH "repos/$REPO/git/refs/tags/$1" -f sha="$TARGET" -F force=true >/dev/null
             else
               gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/$1" -f sha="$TARGET" >/dev/null
@@ -424,12 +403,12 @@ jobs:
           echo "moved=${MOVED[*]}" >> "$GITHUB_OUTPUT"
 
       - name: Summarize
-        if: always() && steps.version.outputs.version != ''
+        if: always() && steps.resolve.outputs.tag != ''
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-          PREVIOUS: ${{ steps.version.outputs.previous }}
-          EXPLICIT: ${{ steps.version.outputs.explicit }}
-          RECOVERY: ${{ steps.version.outputs.recovery }}
+          VERSION: ${{ steps.resolve.outputs.tag }}
+          PREVIOUS: ${{ steps.resolve.outputs.previous }}
+          EXPLICIT: ${{ steps.resolve.outputs.explicit }}
+          RECOVERY: ${{ steps.resolve.outputs.recovery }}
           STATE: ${{ steps.reconcile.outputs.state }}
           IS_LATEST: ${{ steps.reconcile.outputs.is_latest }}
           UPLOADED: ${{ steps.reconcile.outputs.uploaded }}
