@@ -1,0 +1,438 @@
+name: Release on merge (reusable)
+
+# The second half of a release for a repository that commits its version (version-bump-pr.yaml is
+# the first). On a push to the default branch, decide whether the push is the merge of
+# version-bump-pr's pull request for the version it now carries, and whether CI passed on it. It
+# tags nothing: the caller's next job calls simple-tag-and-release when the `release` output is
+# true, so that call is pinned in the caller like any other.
+#
+#   versions   contents: read. Runs the repository's version_command on the pushed commit, its
+#              first parent and the push's `before`. Unchanged: not a release, a green no-op.
+#              Changed by anything but one commit on top of `before`, or lowered: fails red.
+#   authorize  no checkout and no repository code: GitHub API calls only. Exactly one merged pull
+#              request from this repository's release/<tag>, opened by github-actions[bot], holding
+#              one bot commit; the commit and the merge change only allowed_files.
+#   ci         require-ci-green on the merge commit; sets release=true only when it passed.
+#
+# The caller runs it on `push` to the default branch, with `paths:` naming the version file.
+#
+# The inline scripts are tested by scripts/test-release-on-merge.sh, which extracts them from this
+# file with yq. Keep each one self-contained: it reads its inputs from env only.
+on:
+  workflow_call:
+    inputs:
+      version_command:
+        description: >-
+          A command, run with bash from the repository root, that prints the version the
+          repository carries (X.Y.Z, one line). It runs in the versions job only, on the pushed
+          commit, its first parent and the push's `before`.
+        type: string
+        required: true
+      allowed_files:
+        description: >-
+          The files, relative to the repository root and separated by spaces or newlines, that a
+          release may change: the same list as version-bump-pr's. The bump commit and the merge
+          must change nothing else.
+        type: string
+        required: true
+      tag_prefix:
+        description: "Text before X.Y.Z in a release tag: `v` for vX.Y.Z, `<plugin>--v` for <plugin>--vX.Y.Z"
+        type: string
+        required: false
+        default: "v"
+      ci_workflow:
+        description: "The CI workflow file in .github/workflows that must have passed on the merge commit"
+        type: string
+        required: false
+        default: "ci.yaml"
+    outputs:
+      release:
+        description: "true only when the push is an authorized release and CI passed on it; otherwise empty"
+        value: ${{ jobs.ci.outputs.release }}
+      version:
+        description: "The version to release, X.Y.Z; empty unless release is true"
+        value: ${{ jobs.ci.outputs.version }}
+      tag:
+        description: "The tag to release, <tag_prefix>X.Y.Z, for simple-tag-and-release; empty unless release is true"
+        value: ${{ jobs.ci.outputs.tag }}
+
+permissions:
+  contents: read
+
+# One at a time per repository and never cancelled: a run that started finishes. A group of its
+# own, so it does not deadlock with simple-tag-and-release's job group (release-<repo>) or a
+# caller's group.
+concurrency:
+  group: release-on-merge-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  # Repository code (version_command) runs here, with a read-only token, and nothing it does here
+  # reaches the other jobs except the outputs, which they check again.
+  versions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      candidate: ${{ steps.versions.outputs.candidate }}
+      version: ${{ steps.versions.outputs.version }}
+      previous: ${{ steps.versions.outputs.previous }}
+
+    steps:
+      - name: Refuse anything but a push to the default branch
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "push" ] || [ -z "$DEFAULT_BRANCH" ] || [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "release-on-merge runs on a push to the default branch (${DEFAULT_BRANCH:-unknown}) only, got $EVENT on $REF. Nothing was changed." >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The push's `before` as well as the first parent: the whole history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare the version with the first parent's and the push's
+        id: versions
+        env:
+          VERSION_COMMAND: ${{ inputs.version_command }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "$*" >&2
+            exit 1
+          }
+          VERSION_REGEX='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+
+          if [ -z "$TAG_PREFIX" ] || ! [[ "$TAG_PREFIX" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            fail "tag_prefix '$TAG_PREFIX' must be non-empty and hold only letters, digits and '.', '_', '/', '-'. Nothing was changed."
+          fi
+          if [ -z "$VERSION_COMMAND" ]; then
+            fail "version_command is empty. Nothing was changed."
+          fi
+          if [ "$(git rev-parse HEAD)" != "$SHA" ]; then
+            fail "The checkout is $(git rev-parse HEAD), not the pushed $SHA. Nothing was changed."
+          fi
+
+          WORKTREES=()
+          # Cleanup only: a worktree that cannot be removed changes no result.
+          cleanup() {
+            for dir in "${WORKTREES[@]}"; do
+              git worktree remove --force "$dir" >/dev/null 2>&1 || true
+              rm -rf "$dir"
+            done
+          }
+          trap cleanup EXIT
+          # The version the commit $1 carries, by the repository's own command, run in a worktree
+          # of that commit.
+          version_at() {
+            local dir out
+            dir=$(mktemp -d)
+            WORKTREES+=("$dir")
+            git worktree add --quiet --detach "$dir" "$1"
+            if ! out=$(cd "$dir" && bash -c "$VERSION_COMMAND"); then
+              fail "version_command failed on $2 ($1). Nothing was changed."
+            fi
+            if ! [[ "$out" =~ $VERSION_REGEX ]]; then
+              fail "version_command printed '$out' on $2 ($1), not one X.Y.Z line. Nothing was changed."
+            fi
+            VERSION_AT=$out
+          }
+
+          if ! PARENT=$(git rev-parse --verify --quiet 'HEAD^1^{commit}'); then
+            fail "$SHA has no parent, so there is no version to compare with. Nothing was changed."
+          fi
+          # The push's `before`: without it, what the push changed is unknown.
+          if ! [[ "$BEFORE" =~ ^[0-9a-f]{40}$ ]] || [[ "$BEFORE" =~ ^0+$ ]]; then
+            fail "The push has no previous commit ('$BEFORE'), so what it changed is unknown. Nothing was released."
+          fi
+          if ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            fail "The push's previous commit $BEFORE is not in the history (a force push?), so what it changed is unknown. Nothing was released."
+          fi
+
+          version_at "$SHA" "the pushed commit"
+          CURRENT=$VERSION_AT
+
+          # More than one commit on top of `before` (a fast-forward of several commits, a rebase
+          # merge): the version must not have changed across the push, since no one pull request
+          # merge authorizes it.
+          if [ "$BEFORE" != "$PARENT" ]; then
+            version_at "$BEFORE" "the push's previous commit"
+            if [ "$VERSION_AT" != "$CURRENT" ]; then
+              fail "The version changed ($VERSION_AT -> $CURRENT) in a push of more than one commit on top of $BEFORE: only the merge commit of version-bump-pr's pull request is released. Nothing was released; revert it and dispatch the release workflow."
+            fi
+            echo "The version is unchanged across the push ($CURRENT): not a release. Nothing to do."
+            echo "candidate=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version_at "$PARENT" "the first parent"
+          PREVIOUS=$VERSION_AT
+          if [ "$CURRENT" = "$PREVIOUS" ]; then
+            echo "The version is unchanged ($CURRENT): not a release commit. Nothing to do."
+            echo "candidate=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          HIGHEST=$(printf '%s\n%s\n' "$CURRENT" "$PREVIOUS" | sort -V | tail -n1)
+          if [ "$HIGHEST" != "$CURRENT" ]; then
+            fail "The version went down ($PREVIOUS -> $CURRENT). Only a higher version is released; revert it. Nothing was released."
+          fi
+          echo "The version changed: $PREVIOUS -> $CURRENT."
+          {
+            echo "candidate=true"
+            echo "version=$CURRENT"
+            echo "previous=$PREVIOUS"
+          } >> "$GITHUB_OUTPUT"
+
+  # API calls only: no checkout, no repository code. Every API error and every response that is not
+  # what the API documents fails.
+  authorize:
+    needs: versions
+    if: needs.versions.outputs.candidate == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # compare/, commits/{sha}.
+      contents: read
+      # commits/{sha}/pulls, pulls/{number}, pulls/{number}/commits.
+      pull-requests: read
+    outputs:
+      authorized: ${{ steps.authorize.outputs.authorized }}
+      version: ${{ steps.authorize.outputs.version }}
+      tag: ${{ steps.authorize.outputs.tag }}
+
+    steps:
+      - name: Authorize the release by its pull request
+        id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERSION: ${{ needs.versions.outputs.version }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          ALLOWED_FILES: ${{ inputs.allowed_files }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "$*" >&2
+            exit 1
+          }
+          # The association of a fresh merge commit with its pull request can lag the push, so an
+          # empty list is read again a few times. Anything else is decided on the first read.
+          ATTEMPTS="${AUTHORIZE_ATTEMPTS:-4}"
+          DELAY="${AUTHORIZE_DELAY:-10}"
+          BOT_NAME="github-actions[bot]"
+          BOT_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The versions job ran repository code: its output is checked again.
+          if [ -z "$TAG_PREFIX" ] || ! [[ "$TAG_PREFIX" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            fail "tag_prefix '$TAG_PREFIX' must be non-empty and hold only letters, digits and '.', '_', '/', '-'. Nothing was released."
+          fi
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            fail "The versions job reported '$VERSION', not X.Y.Z. Nothing was released."
+          fi
+          if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            fail "The pushed SHA '$SHA' is not a full commit SHA. Nothing was released."
+          fi
+          TAG="$TAG_PREFIX$VERSION"
+          BRANCH="release/$TAG"
+
+          read -r -a ENTRIES <<<"$(tr '\n' ' ' <<<"$ALLOWED_FILES")"
+          if [ "${#ENTRIES[@]}" -eq 0 ]; then
+            fail "allowed_files is empty. Name the files a release may change. Nothing was released."
+          fi
+          for path in "${ENTRIES[@]}"; do
+            if [[ "$path" == *[[:cntrl:]]* || "$path" == /* || "/$path/" == */../* || "/$path/" == */./* || "/$path/" == */.git/* ]]; then
+              fail "allowed_files entry '$path' must be a plain path relative to the repository root. Nothing was released."
+            fi
+          done
+          ALLOWED_JSON=$(jq -cn '$ARGS.positional' --args "${ENTRIES[@]}")
+
+          # The files the commit (or commit range) changed, as the API reports them, both names of a
+          # rename: one line per file that may not change, JSON-quoted, with the reason.
+          # A listing that may be truncated (the API stops at 300 files) fails.
+          outside() {
+            jq -r --argjson allowed "$ALLOWED_JSON" '
+              if type != "object" or (.files | type) != "array" then error("no file list") else . end
+              | if (.files | length) >= 300 then error("300 or more files: the list may be truncated") else . end
+              | if (.files | length) == 0 then error("no files changed") else . end
+              | [.files[] | .filename, (.previous_filename // empty)]
+              | .[]
+              | if type != "string" then "\(tojson) (not a file name)"
+                elif test("[\\x00-\\x1f\\x7f]") then "\(tojson) (control character)"
+                elif (. as $f | any($allowed[]; . == $f)) then empty
+                else "\(tojson) (not in allowed_files)" end'
+          }
+
+          # The pushed commit and its first parent, from the API.
+          if ! COMMIT=$(gh api "repos/$REPO/commits/$SHA"); then
+            fail "Could not read $SHA. Nothing was released; re-run once the API answers."
+          fi
+          if ! PARENT=$(jq -er '.parents[0].sha | select(test("^[0-9a-f]{40}$"))' <<<"$COMMIT"); then
+            fail "$SHA has no first parent in the API's answer. Nothing was released."
+          fi
+          SUBJECT=$(jq -r '.commit.message // "" | split("\n")[0]' <<<"$COMMIT")
+          echo "Pushed commit $SHA: '$SUBJECT' (diagnostic only); first parent $PARENT."
+
+          # What the push changed on the default branch.
+          if ! COMPARE=$(gh api "repos/$REPO/compare/$PARENT...$SHA"); then
+            fail "Could not compare $PARENT...$SHA. Nothing was released; re-run once the API answers."
+          fi
+          if ! BAD=$(outside <<<"$COMPARE"); then
+            fail "The file list of $PARENT...$SHA is malformed or incomplete. Nothing was released."
+          fi
+          if [ -n "$BAD" ]; then
+            fail "$SHA changes files outside allowed_files: $(tr '\n' ' ' <<<"$BAD")Nothing was released."
+          fi
+
+          # The pull request that merged it.
+          LIST=$(mktemp)
+          NUMBERS=""
+          for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
+            if ! gh api --paginate "repos/$REPO/commits/$SHA/pulls?per_page=100" >"$LIST"; then
+              fail "Could not list the pull requests of $SHA. Nothing was released; re-run once the API answers."
+            fi
+            # --paginate prints one JSON array per page.
+            if ! NUMBERS=$(jq -s -r '
+              if all(.[]; type == "array") then (add // []) else error("not a list of pull requests") end
+              | if all(.[]; type == "object" and (.number | type) == "number") then .[].number
+                else error("an entry without a pull request number") end' "$LIST"); then
+              fail "The pull request list of $SHA is malformed. Nothing was released."
+            fi
+            if [ -n "$NUMBERS" ] || [ "$attempt" -eq "$ATTEMPTS" ]; then
+              break
+            fi
+            echo "No pull request is associated with $SHA yet; reading again in ${DELAY}s."
+            sleep "$DELAY"
+          done
+
+          # Each candidate is judged on its own full record, read once.
+          QUALIFYING=()
+          REPORT=()
+          for number in $NUMBERS; do
+            if ! PR=$(gh api "repos/$REPO/pulls/$number"); then
+              fail "Could not read pull request #$number. Nothing was released; re-run once the API answers."
+            fi
+            if ! VERDICT=$(jq -r --arg sha "$SHA" --arg repo "$REPO" --arg base "$DEFAULT_BRANCH" --arg head "$BRANCH" --arg bot "$BOT_NAME" '
+              if type != "object" then error("not a pull request") else . end
+              | [
+                  (if .merged != true or .merged_at == null then "not merged" else empty end),
+                  (if .merge_commit_sha != $sha then "merged as \(.merge_commit_sha // "nothing"), not \($sha)" else empty end),
+                  (if .base.ref != $base or .base.repo.full_name != $repo
+                    then "into \(.base.repo.full_name // "?"):\(.base.ref // "?"), not \($repo):\($base)" else empty end),
+                  (if .head.repo.full_name != $repo then "from \(.head.repo.full_name // "a deleted repository"), not \($repo)" else empty end),
+                  (if .head.ref != $head then "from branch \(.head.ref // "?"), not \($head)" else empty end),
+                  (if .user.login != $bot or .user.type != "Bot"
+                    then "opened by \(.user.login // "?"), not \($bot)" else empty end)
+                ]
+              | if length == 0 then "ok" else join("; ") end' <<<"$PR"); then
+              fail "Pull request #$number is malformed. Nothing was released."
+            fi
+            if [ "$VERDICT" = "ok" ]; then
+              QUALIFYING+=("$number")
+              HEAD_SHA=$(jq -r '.head.sha // ""' <<<"$PR")
+              REPORT+=("#$number: qualifies")
+            else
+              REPORT+=("#$number: $VERDICT")
+            fi
+          done
+          for line in "${REPORT[@]}"; do
+            echo "  $line"
+          done
+          if [ "${#QUALIFYING[@]}" -eq 0 ]; then
+            fail "The version changed to ${TAG}, but $SHA is not the merge of version-bump-pr's $BRANCH pull request (${#REPORT[@]} associated). Nothing was released: revert the change and dispatch the release workflow."
+          fi
+          if [ "${#QUALIFYING[@]}" -gt 1 ]; then
+            fail "$SHA is the merge of ${#QUALIFYING[@]} qualifying pull requests (${QUALIFYING[*]}), which cannot be. Nothing was released; it needs a human."
+          fi
+          NUMBER=${QUALIFYING[0]}
+
+          # Its content: exactly the one commit version-bump-pr pushes, authored and committed by
+          # the identity it commits with, on the PR's head, changing only allowed_files. Any
+          # workflow's GITHUB_TOKEN can open a bot pull request, so the author alone proves little.
+          if ! gh api --paginate "repos/$REPO/pulls/$NUMBER/commits?per_page=100" >"$LIST"; then
+            fail "Could not list the commits of pull request #$NUMBER. Nothing was released; re-run once the API answers."
+          fi
+          if ! COMMITS=$(jq -s -r --arg name "$BOT_NAME" --arg email "$BOT_EMAIL" '
+            if all(.[]; type == "array") then (add // []) else error("not a list of commits") end
+            | if length != 1 then "count \(length)"
+              elif (.[0].sha | type) != "string" or (.[0].sha | test("^[0-9a-f]{40}$") | not) then error("no sha")
+              elif .[0].commit.author.name != $name or .[0].commit.author.email != $email
+                or .[0].commit.committer.name != $name or .[0].commit.committer.email != $email
+              then "identity \(.[0].commit.author.name // "?") <\(.[0].commit.author.email // "?")> / \(.[0].commit.committer.name // "?") <\(.[0].commit.committer.email // "?")>"
+              else "ok \(.[0].sha)" end' "$LIST"); then
+            fail "The commit list of pull request #$NUMBER is malformed. Nothing was released."
+          fi
+          case "$COMMITS" in
+          "ok "*) BUMP_SHA=${COMMITS#ok } ;;
+          "count "*) fail "Pull request #$NUMBER holds ${COMMITS#count } commits, not the one bump commit version-bump-pr pushes. Nothing was released: dispatch the release workflow again to refresh it, then merge." ;;
+          *) fail "The commit of pull request #$NUMBER is not version-bump-pr's: $COMMITS, not $BOT_NAME <$BOT_EMAIL>. Nothing was released." ;;
+          esac
+          if [ "$BUMP_SHA" != "$HEAD_SHA" ]; then
+            fail "Pull request #$NUMBER's commit $BUMP_SHA is not its head $HEAD_SHA. Nothing was released."
+          fi
+          if ! BUMP=$(gh api --paginate "repos/$REPO/commits/$BUMP_SHA" | jq -s 'if all(.[]; type == "object") then {files: (map(.files // []) | add)} else error("not a commit") end'); then
+            fail "Could not read the bump commit $BUMP_SHA. Nothing was released; re-run once the API answers."
+          fi
+          if ! BAD=$(outside <<<"$BUMP"); then
+            fail "The file list of the bump commit $BUMP_SHA is malformed or incomplete. Nothing was released."
+          fi
+          if [ -n "$BAD" ]; then
+            fail "The bump commit $BUMP_SHA changes files outside allowed_files: $(tr '\n' ' ' <<<"$BAD")Nothing was released."
+          fi
+
+          echo "Authorized by pull request #$NUMBER (bump commit $BUMP_SHA): release $TAG once CI passes on $SHA."
+          {
+            echo "authorized=true"
+            echo "pull_request=$NUMBER"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  # The tag is never created before the default branch's CI passed on this exact commit: the newest
+  # run of ci_workflow on this SHA, for the push to the default branch, with ci-result green.
+  ci:
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      actions: read
+    outputs:
+      release: ${{ steps.mark.outputs.release }}
+      version: ${{ steps.mark.outputs.version }}
+      tag: ${{ steps.mark.outputs.tag }}
+    steps:
+      - name: Wait for CI to pass on the merge commit
+        uses: leinardi/gh-composite-actions/require-ci-green@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
+        with:
+          sha: ${{ github.sha }}
+          workflow: .github/workflows/${{ inputs.ci_workflow }}
+          accepted-events: push
+          default-branch: ${{ github.event.repository.default_branch }}
+
+      # Reached only when the gate passed: the one place that says "release".
+      - name: Mark the release
+        id: mark
+        env:
+          VERSION: ${{ needs.authorize.outputs.version }}
+          TAG: ${{ needs.authorize.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "Authorized and CI green: release $TAG."
+          {
+            echo "release=true"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
