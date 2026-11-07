@@ -218,7 +218,7 @@ bump_job() {
 publish() {
 	RUN_IN="$PUB" run_step publish DRY_RUN="${1:-false}" REPO=leinardi/test DEFAULT_BRANCH=main BASE_SHA="$HEAD_SHA" \
 		VERSION="${VERSION_OUT-1.2.1}" TAG="${TAG_OUT-v1.2.1}" TAG_PREFIX="${PREFIX:-v}" \
-		ALLOWED_FILES="${PUB_ALLOWED-VERSION}" CI_WORKFLOW="${CI-ci.yaml}" PATCH="$PATCH" GH_TOKEN=stub
+		ALLOWED_FILES="${PUB_ALLOWED-VERSION}" CI_WORKFLOW="${PUB_CI-ci.yaml}" PATCH="$PATCH" GH_TOKEN=stub
 }
 pr() {
 	# number head_repo head_ref login
@@ -655,7 +655,7 @@ done
 for bad in "" "ci" "../ci.yaml" "ci.yaml --ref main" "sub/ci.yaml"; do
 	new_repo
 	bump_job 1.2.1
-	CI="$bad" publish
+	PUB_CI="$bad" publish
 	if [ "$STATUS" -ne 0 ] && grep -q "ci_workflow must be" <<<"$LOG" && [ ! -s "$GH_STUB_DIR/calls" ]; then
 		ok "ci_workflow '$bad' is refused before any call"
 	else
