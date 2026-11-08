@@ -10,8 +10,10 @@ updates:
     cooldown:
       default-days: 7
     labels: ["dependencies", "ci"]
+    # The reusable workflows in .github/workflows ship to every caller, and they share the directory
+    # with this repository's local-*.yaml, so every bump is a fix(deps) that releases.
     commit-message:
-      prefix: "chore(deps)"
+      prefix: "fix(deps)"
     groups:
       github-actions:
         patterns:
