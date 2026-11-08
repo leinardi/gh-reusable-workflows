@@ -11,17 +11,44 @@ on:
         description: "Dry run: resolve the version and print the plan, change nothing"
         type: boolean
         default: false
+  # A Dependabot merge that leaves only Dependabot's work unreleased releases a patch on its own.
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
 
+# Push runs hold one group for the whole workflow, so a Dependabot release picks its version and
+# publishes it before the next push's run picks one. Never cancelled; a newer push may replace a
+# waiting run, whose commits it covers. A dispatch runs on its own.
+concurrency:
+  group: "${{ github.event_name == 'push' && format('release-flow-{0}', github.repository) || github.run_id }}"
+  cancel-in-progress: false
+
 jobs:
+  dependabot:
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    # The local file, like the release below.
+    uses: ./.github/workflows/dependabot-release.yaml
+    with:
+      ci_workflow: local-ci.yaml
+
   release:
+    needs: dependabot
+    # A dispatch skips the dependabot job; always() keeps this job from being skipped with it.
+    if: >-
+      always()
+      && (github.event_name == 'workflow_dispatch' || needs.dependabot.outputs.release == 'true')
     permissions:
       contents: write
     # The local file, not @v1: every release of this repository runs the
     # workflow it is about to publish.
     uses: ./.github/workflows/simple-tag-and-release.yaml
     with:
-      version: ${{ inputs.version }}
-      dry_run: ${{ inputs.dry_run }}
+      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || needs.dependabot.outputs.version }}
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}

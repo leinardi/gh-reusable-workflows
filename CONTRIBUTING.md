@@ -56,3 +56,8 @@ repository's own `simple-tag-and-release.yaml`, so a release always publishes wi
 is releasing. Publishing moves `v1`, which every `@v1` caller picks up immediately. See
 [`.github/workflows/simple-tag-and-release.md`](.github/workflows/simple-tag-and-release.md) for the
 details and for recovering a failed run.
+
+Merging a Dependabot pull request that bumps a `fix(deps)` pin releases the next patch on its own,
+through the same workflow, when nothing else is unreleased and CI passes on the merge. With other
+work unreleased, it leaves a notice and the release to you. See
+[`.github/workflows/dependabot-release.md`](.github/workflows/dependabot-release.md).

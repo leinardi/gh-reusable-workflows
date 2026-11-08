@@ -1,0 +1,379 @@
+name: Dependabot release (reusable)
+
+# Releases a patch on its own when the push that merges a Dependabot pull request leaves nothing
+# but Dependabot's work unreleased. For a repository whose callers run what it ships (actions,
+# reusable workflows), so a pin bump reaches them without a human dispatching the release. It
+# tags nothing: the caller's next job calls simple-tag-and-release with the `version` output when
+# `release` is true, so that call is pinned in the caller like any other.
+#
+#   authorize  no checkout and no repository code: GitHub API calls only. The highest release tag
+#              is an ancestor of the push, and every commit since it is Dependabot's: a commit it
+#              authored (and GitHub verified), or the merge of one of its pull requests. At least
+#              one is a `fix`; none is breaking (subject `!` or a footer). The version is that tag's
+#              patch + 1.
+#              The whole change must be action pins (and pre-commit revs): authorship rests on
+#              GitHub's attribution, which a commit can borrow, so what ships is checked too. A
+#              re-run on the release commit itself finishes that release instead.
+#   ci         require-ci-green on the pushed commit; then the pushed commit must still be the
+#              default branch's head, since a newer push's run covers it too. Sets release=true.
+#
+# The caller must hold its push runs in one concurrency group for the whole workflow (see the .md):
+# the version is picked here and published in the caller's next job, so two runs between those
+# points would pick the same one.
+#
+# Anything else unreleased (a feat or fix merged by hand, a commit pushed to a Dependabot branch)
+# is a green no-op with a notice: that release is a human's, dispatched as usual.
+#
+# The caller runs it on `push` to the default branch, next to its workflow_dispatch release.
+#
+# The inline scripts are tested by scripts/test-dependabot-release.sh, which extracts them from
+# this file with yq. Keep each one self-contained: it reads its inputs from env only.
+on:
+  workflow_call:
+    inputs:
+      tag_prefix:
+        description: "Text before X.Y.Z in a release tag: `v` for vX.Y.Z, `<plugin>--v` for <plugin>--vX.Y.Z"
+        type: string
+        required: false
+        default: "v"
+      ci_workflow:
+        description: "The CI workflow file in .github/workflows that must have passed on the pushed commit"
+        type: string
+        required: false
+        default: "ci.yaml"
+    outputs:
+      release:
+        description: "true only when everything unreleased is Dependabot's and CI passed on it; otherwise empty"
+        value: ${{ jobs.ci.outputs.release }}
+      version:
+        description: "The version to release, X.Y.Z; empty unless release is true"
+        value: ${{ jobs.ci.outputs.version }}
+      tag:
+        description: "The tag to release, <tag_prefix>X.Y.Z; empty unless release is true"
+        value: ${{ jobs.ci.outputs.tag }}
+
+permissions:
+  contents: read
+
+# One at a time per repository and never cancelled: a run that started finishes. A newer push may
+# replace a pending run, which is fine: its range holds the replaced push's commits too. A group of
+# its own, so it does not deadlock with simple-tag-and-release's job group (release-<repo>).
+concurrency:
+  group: dependabot-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  # API calls only: no checkout, no repository code. Every API error and every response that is not
+  # what the API documents fails; everything that is simply not Dependabot's skips.
+  authorize:
+    # A cheap first filter, so an ordinary push spends no runner: the push must end in the merge of
+    # a pull request from a dependabot/ branch. The step below checks it for real.
+    if: >-
+      github.event_name == 'push'
+      && startsWith(github.event.head_commit.message, 'Merge pull request #')
+      && contains(github.event.head_commit.message, '/dependabot/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # git/matching-refs, compare/.
+      contents: read
+      # commits/{sha}/pulls.
+      pull-requests: read
+    outputs:
+      authorized: ${{ steps.authorize.outputs.authorized }}
+      reconcile: ${{ steps.authorize.outputs.reconcile }}
+      version: ${{ steps.authorize.outputs.version }}
+      tag: ${{ steps.authorize.outputs.tag }}
+
+    steps:
+      - name: Check that everything unreleased is Dependabot's
+        id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "$*" >&2
+            exit 1
+          }
+          skip() {
+            echo "::notice title=No Dependabot release::$*"
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          # The association of a fresh merge commit with its pull request can lag the push, so an
+          # empty list is read again a few times. Anything else is decided on the first read.
+          ATTEMPTS="${AUTHORIZE_ATTEMPTS:-4}"
+          DELAY="${AUTHORIZE_DELAY:-10}"
+          BOT="dependabot[bot]"
+
+          if [ "$EVENT" != "push" ] || [ -z "$DEFAULT_BRANCH" ] || [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            fail "dependabot-release runs on a push to the default branch (${DEFAULT_BRANCH:-unknown}) only, got $EVENT on $REF. Nothing was released."
+          fi
+          if [ -z "$TAG_PREFIX" ] || ! [[ "$TAG_PREFIX" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            fail "tag_prefix '$TAG_PREFIX' must be non-empty and hold only letters, digits and '.', '_', '/', '-'. Nothing was released."
+          fi
+          if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            fail "The pushed SHA '$SHA' is not a full commit SHA. Nothing was released."
+          fi
+
+          # The highest release tag, <prefix>X.Y.Z. The prefix holds only literal characters once
+          # its dots are escaped.
+          PREFIX_RE=${TAG_PREFIX//./\\.}
+          if ! REFS=$(gh api --paginate "repos/$REPO/git/matching-refs/tags/$TAG_PREFIX"); then
+            fail "Could not list the tags. Nothing was released; re-run once the API answers."
+          fi
+          if ! TAGS=$(jq -s -r --arg re "^refs/tags/${PREFIX_RE}(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" '
+            if all(.[]; type == "array") then (add // []) else error("not a list of refs") end
+            | .[] | .ref | select(type == "string" and test($re)) | ltrimstr("refs/tags/")' <<<"$REFS"); then
+            fail "The tag list is malformed. Nothing was released."
+          fi
+          if [ -z "$TAGS" ]; then
+            skip "There is no ${TAG_PREFIX}X.Y.Z release yet: the first release is dispatched by hand."
+          fi
+          LAST=$(while read -r tag; do printf '%s\n' "${tag#"$TAG_PREFIX"}"; done <<<"$TAGS" | sort -V | tail -n1)
+          LAST_TAG="$TAG_PREFIX$LAST"
+          IFS=. read -r MAJOR MINOR PATCH <<<"$LAST"
+          VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+          TAG="$TAG_PREFIX$VERSION"
+
+          # The commits since that release. The API lists at most 250 commits in one comparison.
+          if ! COMPARE=$(gh api "repos/$REPO/compare/$LAST_TAG...$SHA"); then
+            fail "Could not compare $LAST_TAG...$SHA. Nothing was released; re-run once the API answers."
+          fi
+          if ! STATUS=$(jq -er '.status | select(type == "string")' <<<"$COMPARE"); then
+            fail "The comparison $LAST_TAG...$SHA is malformed. Nothing was released."
+          fi
+          case "$STATUS" in
+          ahead) ;;
+          identical)
+            # A re-run of the run that released it: simple-tag-and-release is idempotent, so it
+            # finishes whatever the first run left undone (the moving vMAJOR and latest tags).
+            echo "$SHA is already the release $LAST_TAG: finishing it, in case a step after the tag failed."
+            {
+              echo "authorized=true"
+              echo "reconcile=true"
+              echo "version=$LAST"
+              echo "tag=$LAST_TAG"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+            ;;
+          behind) skip "$SHA is older than the release $LAST_TAG: nothing to release." ;;
+          *) fail "The release $LAST_TAG is not an ancestor of $SHA ($STATUS). Nothing was released; it needs a human." ;;
+          esac
+
+          # One line per commit: sha, parent count, then what decides it. The subject is last, as it
+          # may hold anything but a newline. A breaking-change footer anywhere in the message counts.
+          if ! COMMITS=$(jq -er --arg bot "$BOT" '
+            if (.commits | type) != "array" or (.total_commits | type) != "number" then error("no commit list")
+            elif (.commits | length) != .total_commits then error("truncated")
+            else . end
+            | .commits[]
+            | if (.sha | type) != "string" or (.sha | test("^[0-9a-f]{40}$") | not) or (.parents | type) != "array"
+              then error("a commit without a sha or parents") else . end
+            | [ .sha,
+                (.parents | length | tostring),
+                (.parents[1].sha // "-"),
+                (if .author.login == $bot and .author.type == "Bot" then "bot" else "other" end),
+                (if .commit.verification.verified == true then "verified" else "unverified" end),
+                (if (.commit.message // "") | test("(^|\n)BREAKING[ -]CHANGE:") then "breaking" else "-" end),
+                (.commit.message // "" | split("\n")[0])
+              ] | join(" ")' <<<"$COMPARE"); then
+            fail "The commit list of $LAST_TAG...$SHA is malformed or truncated (more than 250 commits?). Nothing was released."
+          fi
+
+          # A merge commit must be the merge of a Dependabot pull request, from its own head.
+          dependabot_merge() {
+            local sha=$1 head=$2 list numbers number pr attempt
+            list=$(mktemp)
+            numbers=""
+            for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
+              if ! gh api --paginate "repos/$REPO/commits/$sha/pulls?per_page=100" >"$list"; then
+                fail "Could not list the pull requests of $sha. Nothing was released; re-run once the API answers."
+              fi
+              if ! numbers=$(jq -s -r --arg sha "$sha" '
+                if all(.[]; type == "array") then (add // []) else error("not a list of pull requests") end
+                | .[] | select(type == "object" and .merge_commit_sha == $sha) | .number
+                | if type == "number" then . else error("no number") end' "$list"); then
+                fail "The pull request list of $sha is malformed. Nothing was released."
+              fi
+              if [ -n "$numbers" ] || [ "$attempt" -eq "$ATTEMPTS" ]; then
+                break
+              fi
+              echo "No pull request is associated with $sha yet; reading again in ${DELAY}s."
+              sleep "$DELAY"
+            done
+            for number in $numbers; do
+              if ! pr=$(gh api "repos/$REPO/pulls/$number"); then
+                fail "Could not read pull request #$number. Nothing was released; re-run once the API answers."
+              fi
+              if jq -e --arg sha "$sha" --arg head "$head" --arg repo "$REPO" --arg base "$DEFAULT_BRANCH" --arg bot "$BOT" '
+                type == "object"
+                and .merged == true and .merge_commit_sha == $sha
+                and .user.login == $bot and .user.type == "Bot"
+                and .head.repo.full_name == $repo and (.head.ref | type == "string" and startswith("dependabot/"))
+                and .head.sha == $head
+                and .base.repo.full_name == $repo and .base.ref == $base' <<<"$pr" >/dev/null; then
+                echo "  $sha: the merge of Dependabot's pull request #$number"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          FIXES=0
+          while read -r sha parents second author verified breaking subject; do
+            if [ "$breaking" = breaking ] || [[ "$subject" =~ ^[a-z]+(\([^\)]*\))?!: ]]; then
+              skip "$sha ('$subject') is a breaking change. Dispatch the release by hand."
+            fi
+            if [ "$parents" = 1 ]; then
+              if [ "$author" != bot ] || [ "$verified" != verified ]; then
+                skip "$sha ('$subject') is not a verified commit by $BOT: $LAST_TAG...$SHA holds more than Dependabot's work. Dispatch the release by hand."
+              fi
+              if [[ "$subject" =~ ^fix(\([^\)]*\))?: ]]; then
+                FIXES=$((FIXES + 1))
+              fi
+              echo "  $sha: $subject"
+            elif [ "$parents" = 2 ]; then
+              if ! dependabot_merge "$sha" "$second"; then
+                skip "$sha ('$subject') is not the merge of a Dependabot pull request from its head: $LAST_TAG...$SHA holds more than Dependabot's work. Dispatch the release by hand."
+              fi
+            else
+              skip "$sha has $parents parents, so it is no Dependabot merge. Dispatch the release by hand."
+            fi
+          done <<<"$COMMITS"
+
+          # What ships, whoever wrote it: the authorship checks above rest on GitHub's attribution,
+          # which a commit can borrow (a verified signature authenticates the committer, not the
+          # author). So the whole change since the release must be what Dependabot's updates are:
+          # modified files whose every change block (a run of removed and added lines with no
+          # unchanged line inside) replaces lines one for one, each removed line with an added one
+          # that is the same line but for its ref: a `uses:` pin moving to another full
+          # SHA (same action, same place, a new version comment), or a hook's `rev:` in
+          # .pre-commit-config.yaml (which ships nothing, but sits unreleased beside the pins). An
+          # added or removed step, or another action, is a human's change.
+          if ! BAD=$(jq -r \
+            --arg pin '^[+-](?<same>\s*(-\s+)?uses:\s*["\x27]?[^@\s"\x27]+@)[0-9a-f]{40}["\x27]?(\s+#.*)?$' \
+            --arg rev '^[+-](?<same>\s*rev:\s*)\S+(\s+#.*)?$' '
+            if (.files | type) != "array" then error("no file list")
+            elif (.files | length) >= 300 then error("300 or more files: the list may be truncated")
+            else . end
+            | .files[]
+            | if type != "object" or (.filename | type) != "string" then error("a file without a name")
+              elif .status != "modified" then "\(.filename | tojson) (\(.status // "?"), not modified)"
+              elif (.patch | type) != "string" then "\(.filename | tojson) (no patch: binary or too large)"
+              else .filename as $file
+                # What a changed line must keep: everything but the ref and its comment.
+                | def kept:
+                    if test($pin) then "uses " + (capture($pin).same)
+                    elif $file == ".pre-commit-config.yaml" and test($rev) then "rev " + (capture($rev).same)
+                    else null end;
+                # Change blocks: any line that is not a removal or an addition (context, a hunk header,
+                # "\ No newline") ends one, so no pair crosses an unchanged line.
+                [ .patch | split("\n")
+                  | reduce .[] as $line ({blocks: [], cur: null};
+                      if ($line | test("^[+-]")) then
+                        .cur = ((.cur // {removed: [], added: []})
+                          | if ($line | startswith("-")) then .removed += [$line] else .added += [$line] end)
+                      else
+                        (if .cur != null then .blocks += [.cur] else . end) | .cur = null
+                      end)
+                  | .blocks + (if .cur != null then [.cur] else [] end)
+                  | .[]
+                  | .removed as $removed
+                  | .added as $added
+                  | if ($removed | length) != ($added | length) then
+                      "\($file | tojson): \($removed | length) line(s) removed, \($added | length) added"
+                    else
+                      range($removed | length) as $i
+                      | ($removed[$i] | kept) as $old
+                      | if $old == null or $old != ($added[$i] | kept) then
+                          "\($file | tojson): \($removed[$i] | tojson) -> \($added[$i] | tojson)"
+                        else empty end
+                    end ]
+                | .[0] // empty
+              end' <<<"$COMPARE"); then
+            fail "The file list of $LAST_TAG...$SHA is malformed or incomplete. Nothing was released."
+          fi
+          if [ -n "$BAD" ]; then
+            skip "$LAST_TAG...$SHA changes more than action pins: $(head -n1 <<<"$BAD"). Dispatch the release by hand."
+          fi
+
+          if [ "$FIXES" -eq 0 ]; then
+            skip "Only Dependabot's work since $LAST_TAG, but none of it is a fix: nothing that ships."
+          fi
+          echo "Everything since $LAST_TAG is Dependabot's, with $FIXES fix commit(s): release $TAG once CI passes on $SHA."
+          {
+            echo "authorized=true"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  # The tag is never created before the default branch's CI passed on this exact commit.
+  ci:
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      # require-ci-green reads the CI runs.
+      actions: read
+      # git/ref/heads/<default branch>.
+      contents: read
+    outputs:
+      release: ${{ steps.mark.outputs.release }}
+      version: ${{ steps.mark.outputs.version }}
+      tag: ${{ steps.mark.outputs.tag }}
+    steps:
+      - name: Wait for CI to pass on the pushed commit
+        uses: leinardi/gh-composite-actions/require-ci-green@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
+        with:
+          sha: ${{ github.sha }}
+          workflow: .github/workflows/${{ inputs.ci_workflow }}
+          accepted-events: push
+          default-branch: ${{ github.event.repository.default_branch }}
+
+      # A newer push to the default branch has its own run, which covers this commit too: two runs
+      # releasing would race, and the older one's version would no longer be the highest. A release
+      # being finished has its version already, so it goes on either way.
+      - name: Mark the release, unless the default branch moved on
+        id: mark
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERSION: ${{ needs.authorize.outputs.version }}
+          TAG: ${{ needs.authorize.outputs.tag }}
+          RECONCILE: ${{ needs.authorize.outputs.reconcile }}
+        run: |
+          set -euo pipefail
+          if [ "$RECONCILE" = true ]; then
+            echo "Finishing the release $TAG."
+            {
+              echo "release=true"
+              echo "version=$VERSION"
+              echo "tag=$TAG"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! HEAD=$(gh api "repos/$REPO/git/ref/heads/$DEFAULT_BRANCH" --jq '.object.sha'); then
+            echo "Could not read the head of $DEFAULT_BRANCH. Nothing was released; re-run once the API answers." >&2
+            exit 1
+          fi
+          if [ "$HEAD" != "$SHA" ]; then
+            echo "::notice title=No Dependabot release::$DEFAULT_BRANCH moved on to $HEAD; that push's run decides the release."
+            exit 0
+          fi
+          echo "Everything unreleased is Dependabot's and CI is green: release $TAG."
+          {
+            echo "release=true"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
