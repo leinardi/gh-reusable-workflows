@@ -227,6 +227,17 @@ regex_for() {
 # the step scripts test it (grep -E).
 matches() { grep -qE "$1" <<<"$2"; }
 
+echo "# svu"
+
+# svu only derives a version. An explicit one must not depend on downloading it,
+# so a release still goes out while GitHub's release downloads fail.
+SVU_IF=$(wf '.jobs.release.steps[] | select(.name == "Install svu") | .if')
+if [ "$SVU_IF" = "inputs.version == '' && inputs.semver == ''" ]; then
+	ok "svu is installed only when no version is given"
+else
+	not_ok "svu is installed only when no version is given" "if: $SVU_IF"
+fi
+
 echo "# input"
 
 new_repo

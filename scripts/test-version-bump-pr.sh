@@ -227,6 +227,17 @@ pr() {
 }
 bot_pr() { pr "${1:-7}" leinardi/test "${2:-release/v1.2.1}" 'github-actions[bot]' | jq -s . >"$GH_STUB_DIR/pulls.json"; }
 
+echo "# svu"
+
+# svu only derives a version. An explicit one must not depend on downloading it,
+# so a release still goes out while GitHub's release downloads fail.
+SVU_IF=$(wf '.jobs.bump.steps[] | select(.name == "Install svu") | .if')
+if [ "$SVU_IF" = "inputs.version == ''" ]; then
+	ok "svu is installed only when no version is given"
+else
+	not_ok "svu is installed only when no version is given" "if: $SVU_IF"
+fi
+
 echo "# current"
 
 new_repo

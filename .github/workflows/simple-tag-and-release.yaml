@@ -97,7 +97,10 @@ jobs:
           # credential of their own (GIT_CONFIG_* below).
           persist-credentials: false
 
+      # svu only derives a version, so an explicit one needs no download: a
+      # release still goes out while GitHub's release downloads are failing.
       - name: Install svu
+        if: inputs.version == '' && inputs.semver == ''
         uses: leinardi/gh-composite-actions/setup-svu@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
 
       # The release-version action knows `version` only. This keeps the
