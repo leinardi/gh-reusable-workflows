@@ -28,6 +28,7 @@ test: ## Test the inline scripts of the reusable workflows (stub gh, no network,
 	@"$(REPO_ROOT)/scripts/test-simple-tag-and-release.sh"
 	@"$(REPO_ROOT)/scripts/test-version-bump-pr.sh"
 	@"$(REPO_ROOT)/scripts/test-release-on-merge.sh"
+	@"$(REPO_ROOT)/scripts/test-dependabot-release.sh"
 	@"$(REPO_ROOT)/scripts/test-pre-commit-warmup.sh"
 
 endif # MK_LOCAL_TEST_INCLUDED

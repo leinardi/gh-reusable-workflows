@@ -40,6 +40,11 @@ jobs:
   The other half: on the push that merges that pull request, authorize the release through the
   API (the pull request, its one bump commit, the files it changes) and wait for CI on the merge
   commit; the caller's next job then tags and publishes it with `simple-tag-and-release`.
+* **`dependabot-release.yaml`**
+  On the push that merges a Dependabot pull request, release the next patch when everything
+  unreleased is Dependabot's and at least one commit is a `fix`, once CI passes on it; the caller's
+  next job publishes it with `simple-tag-and-release`. For repositories whose callers run what
+  they ship.
 * **`pre-commit-warmup.yaml`**
   Fill the `pre-commit` cache on the default branch so pull-request jobs start warm, and prune the
   older caches it replaces.

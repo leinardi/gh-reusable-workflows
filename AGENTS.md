@@ -12,6 +12,7 @@ their pin.
 | `.github/workflows/simple-tag-and-release.yaml` | reusable | Resolves a version (explicit or svu-derived, any `tag_prefix`), reconciles the GitHub release, moves `vMAJOR`/`latest` (prefix `v` only). |
 | `.github/workflows/version-bump-pr.yaml` | reusable | `bump` job (read-only): the caller's commands and the diff guard, a patch artifact. `publish` job (writes, no repo code): re-checks and applies the patch, pushes `release/<tag>`, opens the PR with `GITHUB_TOKEN`, dispatches CI. |
 | `.github/workflows/release-on-merge.yaml` | reusable | On the merge push: `versions` (read-only, runs `version_command`), `authorize` (API only: the PR, its one bump commit, the files), `ci` (`require-ci-green`). Outputs `release`/`tag`; the caller's `publish` job calls `simple-tag-and-release`. |
+| `.github/workflows/dependabot-release.yaml` | reusable | On a Dependabot merge push: `authorize` (API only: the last release tag, every commit since it Dependabot's verified commit or the merge of its pull request, at least one `fix`), `ci` (`require-ci-green`, then the default branch still at the push). Outputs `release`/`version`/`tag`; the caller's next job calls `simple-tag-and-release`. |
 | `.github/workflows/pre-commit-warmup.yaml` | reusable | Fills the `pre-commit` cache on the default branch, then prunes the older caches of that ref. |
 | `.github/workflows/local-*.yaml` | this repo | This repository's own CI, release and warm-up. They call the local reusable files, not `@v1`. |
 
@@ -20,8 +21,8 @@ Keep it in step with the YAML.
 
 Shared logic lives in composite actions of `leinardi/gh-composite-actions` (`setup-svu`,
 `release-version`, `require-ci-green`, `prune-caches`), pinned to one release SHA everywhere here;
-their tests live there. No reusable workflow here calls another one: a nested `./` call's
-resolution is disputed, so `release-on-merge` only decides, and its callers call
+their tests live there. No reusable workflow here calls another one: a nested `./` call's resolution
+is disputed, so `release-on-merge` and `dependabot-release` only decide, and their callers call
 `simple-tag-and-release` themselves, pinned to the same commit.
 
 ## Common commands
@@ -48,6 +49,7 @@ annotate pull requests.
 | `scripts/test-simple-tag-and-release.sh` | extracts the release workflow's step scripts with `yq` and tests them |
 | `scripts/test-version-bump-pr.sh` | the same for `version-bump-pr` (throwaway repositories, a local bare origin) |
 | `scripts/test-release-on-merge.sh` | the same for `release-on-merge`: the version comparison and the authorization table |
+| `scripts/test-dependabot-release.sh` | the same for `dependabot-release`: the authorization table and the head check |
 | `scripts/test-pre-commit-warmup.sh` | the warm-up's install step, and its cache key and prune wiring against `local-ci.yaml` |
 | `scripts/check-license-headers.sh` | the license-header check |
 | `scripts/bootstrap-mk-common.sh`, `.mk/` | shared make snippets from `leinardi/make-common`; `.mk/test.mk` is local |
@@ -84,6 +86,14 @@ annotate pull requests.
   that commit and the merge change only `allowed_files`. A push of several commits that changes
   the version fails. `release` is true only after `require-ci-green` passed on that SHA. Every API
   error or unexpected response fails closed.
+- **A release nobody dispatched ships only Dependabot's work.** `dependabot-release` releases a
+  patch only when every commit since the highest release tag is a verified commit by
+  `dependabot[bot]` (GitHub's account, not the git author) or the merge of a `dependabot/` pull
+  request from its own head, the whole change moves existing action pins to other full SHAs, line
+  for line (and pre-commit revs, which ship nothing), at least one is a `fix` and none is breaking
+  (subject `!` or footer). Attribution can be borrowed, so the change is what is trusted. Anything
+  else is a green no-op with a notice, never a failure: that release is a human's. Callers hold push
+  runs in one concurrency group for the whole workflow, so no two runs pick the same version.
 - **Repository code never shares a job with a write token.** The caller's `version_command` and
   `bump_command` run only in jobs whose token is `contents: read` (`version-bump-pr`'s `bump`,
   `release-on-merge`'s `versions`), after checkouts with `persist-credentials: false`. Those jobs'
@@ -151,6 +161,7 @@ Run before considering an edit done. `make check` applies to every row.
 | `.github/workflows/simple-tag-and-release.yaml` | `make test`; a step-script change adds a case to `scripts/test-simple-tag-and-release.sh`; update `simple-tag-and-release.md` |
 | `.github/workflows/version-bump-pr.yaml` | `make test`; a step-script change adds a case to `scripts/test-version-bump-pr.sh`; update `version-bump-pr.md` |
 | `.github/workflows/release-on-merge.yaml` | `make test`; a step-script change adds a case to `scripts/test-release-on-merge.sh`; update `release-on-merge.md` |
+| `.github/workflows/dependabot-release.yaml` | `make test`; a step-script change adds a case to `scripts/test-dependabot-release.sh`; update `dependabot-release.md` |
 | `.github/workflows/pre-commit-warmup.yaml` | `make test` (`scripts/test-pre-commit-warmup.sh`); update `pre-commit-warmup.md`; a key change updates `local-ci.yaml`'s restore key too; to see a real prune, `gh workflow run local-pre-commit-warmup.yaml --ref <branch>` |
 | a `leinardi/gh-composite-actions` pin | the same SHA in every workflow and test; `make test`; read that release's notes for input or output changes |
 | `.github/workflows/local-*.yaml`, `.github/dependabot.yml` | `pre-commit run actionlint --all-files` |
