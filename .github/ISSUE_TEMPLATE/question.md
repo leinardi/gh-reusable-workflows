@@ -43,10 +43,10 @@ assignees: []
 
 <!-- Fill in what makes sense for your question, or remove fields that don't apply. -->
 
-* Project version / commit SHA: `?`
-* Operating system and version: `?`
-* Runtime and version (e.g., Node, Python, Java): `?`
-* Any relevant tooling / dependencies and versions: `?`
+* Workflow and the version you pin (tag or SHA): `?`
+* Calling repository and workflow file, if public: `?`
+* Link to the failing run: `?`
+* Runner (`ubuntu-latest`, self-hosted, ...): `?`
 
 ---
 
