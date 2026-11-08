@@ -22,7 +22,7 @@ Repository code never runs next to a write token:
 
 | Job | Permissions | Runs |
 | --- | --- | --- |
-| `bump` | `contents: read` | Checkout (no credential persisted), svu, `version_command`, `release-version`, `bump_command`, the diff guard, `version_command` again; uploads the staged change as a patch artifact (`version-bump-pr-patch`, kept 1 day). |
+| `bump` | `contents: read` | Checkout (no credential persisted), svu (only when `version` is empty), `version_command`, `release-version`, `bump_command`, the diff guard, `version_command` again; uploads the staged change as a patch artifact (`version-bump-pr-patch`, kept 1 day). |
 | `publish` | `contents: write`, `pull-requests: write`, `actions: write` | No repository code. A fresh checkout of the same commit (no credential persisted), the patch applied with `git apply --index` and checked again, then commit, push, pull request and CI dispatch. |
 
 Whatever the commands do to the `bump` job (git config such as `core.fsmonitor`, hooks,

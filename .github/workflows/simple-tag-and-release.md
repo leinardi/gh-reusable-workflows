@@ -82,7 +82,8 @@ to whichever prefix released its highest version last.
 ## What it does, in order
 
 1. Refuses to run from any branch but the default one.
-2. Installs svu, checks `tag_prefix` and the `version` / `semver` pair, and resolves the version as
+2. Installs svu (only when neither `version` nor `semver` is set: an explicit version needs no
+   download), checks `tag_prefix` and the `version` / `semver` pair, and resolves the version as
    above.
 3. Downloads `artifact_name`, if set.
 4. Reconciles the release. The release tag, if it already exists, must point at this commit. Then,
