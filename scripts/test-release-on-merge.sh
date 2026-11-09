@@ -602,7 +602,7 @@ check "ci: needs the authorization" "$(wf '.jobs.ci.needs + " " + .jobs.ci.if')"
 check "ci: waits on the pushed SHA, for the push to the default branch" \
 	"$(wf '.jobs.ci.steps[0].with.sha + " " + .jobs.ci.steps[0].with["accepted-events"]')" "\${{ github.sha }} push"
 check "ci: the pinned require-ci-green" "$(wf '.jobs.ci.steps[0].uses')" \
-	"leinardi/gh-composite-actions/require-ci-green@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa"
+	"leinardi/gh-composite-actions/require-ci-green@addc113a34e0a96ca2e08218380fdecad2fdd230"
 check "ci: release=true is written after the gate, in the same job" "$(wf '.jobs.ci.steps[1].id')" "mark"
 check "the release output is the ci job's mark only" "$(wf '.on.workflow_call.outputs.release.value')" "\${{ jobs.ci.outputs.release }}"
 check "no job calls another workflow (the caller calls simple-tag-and-release)" "$(wf '[.jobs[] | select(has("uses"))] | length')" "0"

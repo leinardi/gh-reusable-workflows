@@ -14,9 +14,9 @@ Every step is idempotent: re-running a failed run finishes what it started, and 
 an earlier run published.
 
 The version is resolved by the
-[`release-version`](https://github.com/leinardi/gh-composite-actions/tree/v1.0.0/release-version)
+[`release-version`](https://github.com/leinardi/gh-composite-actions/tree/v1.4.2/release-version)
 action, and svu is installed by
-[`setup-svu`](https://github.com/leinardi/gh-composite-actions/tree/v1.0.0/setup-svu), both from
+[`setup-svu`](https://github.com/leinardi/gh-composite-actions/tree/v1.4.2/setup-svu), both from
 `leinardi/gh-composite-actions` at a pinned SHA.
 
 ## Inputs

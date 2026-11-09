@@ -11,7 +11,7 @@ It:
 - populates the `~/.cache/pre-commit` cache by running `pre-commit install-hooks`, under the key
   below;
 - prunes the older `pre-commit` caches of the calling ref, keeping the newest `keep_caches`, with
-  the [`prune-caches`](https://github.com/leinardi/gh-composite-actions/tree/v1.0.0/prune-caches)
+  the [`prune-caches`](https://github.com/leinardi/gh-composite-actions/tree/v1.4.2/prune-caches)
   action.
 
 The warm-up is the only writer of this cache: the CI jobs that run `pre-commit` restore it with

@@ -121,7 +121,7 @@ jobs:
       # release still goes out while GitHub's release downloads are failing.
       - name: Install svu
         if: inputs.version == ''
-        uses: leinardi/gh-composite-actions/setup-svu@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
+        uses: leinardi/gh-composite-actions/setup-svu@addc113a34e0a96ca2e08218380fdecad2fdd230 # v1.4.2
 
       - name: Read the version the repository carries
         id: current
@@ -147,7 +147,7 @@ jobs:
       # The carried version is the floor; the bump step makes it strict.
       - name: Resolve the version to release
         id: resolve
-        uses: leinardi/gh-composite-actions/release-version@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
+        uses: leinardi/gh-composite-actions/release-version@addc113a34e0a96ca2e08218380fdecad2fdd230 # v1.4.2
         with:
           version: ${{ inputs.version }}
           tag-prefix: ${{ inputs.tag_prefix }}

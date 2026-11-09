@@ -140,7 +140,7 @@ echo "# prune"
 
 PRUNE_STEP='.jobs.prune.steps[0]'
 check "the prune is the pinned prune-caches action" \
-	"$(wf "$PRUNE_STEP.uses")" "leinardi/gh-composite-actions/prune-caches@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa"
+	"$(wf "$PRUNE_STEP.uses")" "leinardi/gh-composite-actions/prune-caches@addc113a34e0a96ca2e08218380fdecad2fdd230"
 check "the prune deletes under the key prefix and its separator only" \
 	"$(wf "$PRUNE_STEP.with[\"key-prefix\"]")" "\${{ inputs.cache_key_prefix }}|"
 check "the prune keeps keep_caches entries" "$(wf "$PRUNE_STEP.with.keep")" "\${{ inputs.keep_caches }}"
