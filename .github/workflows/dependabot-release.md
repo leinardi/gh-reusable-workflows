@@ -213,6 +213,21 @@ jobs:
 Pin both to the same commit. CI must run on `push` to the default branch with no `paths:` filter,
 or `require-ci-green` finds no run and times out.
 
+**A dispatch skips the `dependabot` job, and a skipped job skips every job below it** under the
+implicit `success()`, not only the jobs that need it directly. In the example, `release` needs
+`dependabot` itself and says `always()`, so it runs. In a longer chain (a `guard` that needs
+`dependabot`, then jobs that need `guard`), give every job below the gate an explicit condition,
+or a dispatch ends green with nothing released:
+
+```yaml
+  ci-green:
+    needs: guard
+    if: ${{ !cancelled() && needs.guard.result == 'success' }}
+```
+
+After wiring a repository, its next release is a dispatch: the wiring commit is not Dependabot's,
+so nothing releases on its own until a release covers it.
+
 ## Tests
 
 `make test` runs `scripts/test-dependabot-release.sh`: the authorization against canned API
