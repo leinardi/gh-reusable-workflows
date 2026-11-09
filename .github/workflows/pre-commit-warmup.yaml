@@ -132,7 +132,7 @@ jobs:
 
     steps:
       - name: Delete older pre-commit caches
-        uses: leinardi/gh-composite-actions/prune-caches@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
+        uses: leinardi/gh-composite-actions/prune-caches@addc113a34e0a96ca2e08218380fdecad2fdd230 # v1.4.2
         with:
           ref: ${{ github.ref }}
           key-prefix: ${{ inputs.cache_key_prefix }}|

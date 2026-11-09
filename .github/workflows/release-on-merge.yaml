@@ -415,7 +415,7 @@ jobs:
       tag: ${{ steps.mark.outputs.tag }}
     steps:
       - name: Wait for CI to pass on the merge commit
-        uses: leinardi/gh-composite-actions/require-ci-green@73fdb81c6cb1d2a3ea7c669e3bc136538e0f4ffa # v1.0.0
+        uses: leinardi/gh-composite-actions/require-ci-green@addc113a34e0a96ca2e08218380fdecad2fdd230 # v1.4.2
         with:
           sha: ${{ github.sha }}
           workflow: .github/workflows/${{ inputs.ci_workflow }}
