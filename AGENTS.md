@@ -88,12 +88,15 @@ annotate pull requests.
   error or unexpected response fails closed.
 - **A release nobody dispatched ships only Dependabot's work.** `dependabot-release` releases a
   patch only when every commit since the highest release tag is a verified commit by
-  `dependabot[bot]` (GitHub's account, not the git author) or the merge of a `dependabot/` pull
-  request from its own head, the whole change moves existing action pins to other full SHAs, line
-  for line (and pre-commit revs, which ship nothing), at least one is a `fix` and none is breaking
-  (subject `!` or footer). Attribution can be borrowed, so the change is what is trusted. Anything
-  else is a green no-op with a notice, never a failure: that release is a human's. Callers hold push
-  runs in one concurrency group for the whole workflow, so no two runs pick the same version.
+  `dependabot[bot]` (GitHub's account, not the git author) committed by `web-flow`, or the merge of
+  a `dependabot/` pull request from its own head, the whole change moves existing action pins to
+  other full SHAs, line for line (and pre-commit revs, which ship nothing), or is a version update
+  of one of the caller's `ecosystems` (a Dockerfile `FROM` tag or digest, a manifest's version one
+  for one, a lockfile line of the shape a version update writes, never another source or package),
+  at least one is a `fix` and none is breaking (subject `!` or footer). Attribution can be borrowed,
+  so the change is what is trusted. Anything else is a green no-op with a notice, never a failure:
+  that release is a human's. Callers hold push runs in one concurrency group for the whole workflow,
+  so no two runs pick the same version.
 - **Repository code never shares a job with a write token.** The caller's `version_command` and
   `bump_command` run only in jobs whose token is `contents: read` (`version-bump-pr`'s `bump`,
   `release-on-merge`'s `versions`), after checkouts with `persist-credentials: false`. Those jobs'

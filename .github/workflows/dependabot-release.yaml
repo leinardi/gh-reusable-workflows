@@ -11,9 +11,10 @@ name: Dependabot release (reusable)
 #              authored (and GitHub verified), or the merge of one of its pull requests. At least
 #              one is a `fix`; none is breaking (subject `!` or a footer). The version is that tag's
 #              patch + 1.
-#              The whole change must be action pins (and pre-commit revs): authorship rests on
-#              GitHub's attribution, which a commit can borrow, so what ships is checked too. A
-#              re-run on the release commit itself finishes that release instead.
+#              The whole change must be action pins (and pre-commit revs), or version updates of
+#              the `ecosystems` input's files (Dockerfile FROM lines, Cargo, Go modules, npm):
+#              authorship rests on GitHub's attribution, which a commit can borrow, so what ships
+#              is checked too. A re-run on the release commit itself finishes that release instead.
 #   ci         require-ci-green on the pushed commit; then the pushed commit must still be the
 #              default branch's head, since a newer push's run covers it too. Sets release=true.
 #
@@ -41,6 +42,11 @@ on:
         type: string
         required: false
         default: "ci.yaml"
+      ecosystems:
+        description: "Dependabot ecosystems whose updates may ship, besides action pins and pre-commit revs: space-separated, any of docker cargo gomod npm. Empty: action pins only"
+        type: string
+        required: false
+        default: ""
     outputs:
       release:
         description: "true only when everything unreleased is Dependabot's and CI passed on it; otherwise empty"
@@ -96,6 +102,7 @@ jobs:
           SHA: ${{ github.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
+          ECOSYSTEMS: ${{ inputs.ecosystems }}
         run: |
           set -euo pipefail
           fail() {
@@ -122,6 +129,19 @@ jobs:
           if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
             fail "The pushed SHA '$SHA' is not a full commit SHA. Nothing was released."
           fi
+          # Split on any whitespace (a YAML block scalar ends in a newline), never globbed; jq gets
+          # the validated words joined by single spaces.
+          set -f
+          # shellcheck disable=SC2206 # deliberate word splitting, globbing is off
+          ECOSYSTEM_LIST=(${ECOSYSTEMS:-})
+          set +f
+          for ecosystem in "${ECOSYSTEM_LIST[@]}"; do
+            case "$ecosystem" in
+            docker | cargo | gomod | npm) ;;
+            *) fail "ecosystems holds '$ecosystem'; it takes only docker, cargo, gomod and npm. Nothing was released." ;;
+            esac
+          done
+          ECOSYSTEMS="${ECOSYSTEM_LIST[*]}"
 
           # The highest release tag, <prefix>X.Y.Z. The prefix holds only literal characters once
           # its dots are escaped.
@@ -180,7 +200,10 @@ jobs:
             | [ .sha,
                 (.parents | length | tostring),
                 (.parents[1].sha // "-"),
-                (if .author.login == $bot and .author.type == "Bot" then "bot" else "other" end),
+                # Dependabot commits are created by GitHub: committer web-flow, signed with
+                # the GitHub key. A commit pushed from a clone with Dependabot as its author is not.
+                (if .author.login == $bot and .author.type == "Bot" and .committer.login == "web-flow"
+                 then "bot" else "other" end),
                 (if .commit.verification.verified == true then "verified" else "unverified" end),
                 (if (.commit.message // "") | test("(^|\n)BREAKING[ -]CHANGE:") then "breaking" else "-" end),
                 (.commit.message // "" | split("\n")[0])
@@ -234,7 +257,7 @@ jobs:
             fi
             if [ "$parents" = 1 ]; then
               if [ "$author" != bot ] || [ "$verified" != verified ]; then
-                skip "$sha ('$subject') is not a verified commit by $BOT: $LAST_TAG...$SHA holds more than Dependabot's work. Dispatch the release by hand."
+                skip "$sha ('$subject') is not a verified commit by $BOT, committed by GitHub: $LAST_TAG...$SHA holds more than Dependabot's work. Dispatch the release by hand."
               fi
               if [[ "$subject" =~ ^fix(\([^\)]*\))?: ]]; then
                 FIXES=$((FIXES + 1))
@@ -258,9 +281,84 @@ jobs:
           # SHA (same action, same place, a new version comment), or a hook's `rev:` in
           # .pre-commit-config.yaml (which ships nothing, but sits unreleased beside the pins). An
           # added or removed step, or another action, is a human's change.
-          if ! BAD=$(jq -r \
+          #
+          # Each ecosystem in ECOSYSTEMS adds its files, by name:
+          #   docker  a Dockerfile's FROM line, the same but for its tag and digest, one for one;
+          #           both sides name a tag or a digest, and a digest is never dropped
+          #   cargo   Cargo.toml: a dependency's version requirement, one for one; Cargo.lock
+          #   gomod   go.mod and go.sum
+          #   npm     package.json: a dependency's version, one for one; package-lock.json
+          # A lockfile (and go.mod, which gains indirect requirements) cannot be paired line by
+          # line, so each of its changed lines must be one a version update writes: a package,
+          # version, checksum or crates.io source in Cargo.lock; a requirement on a module path
+          # with a dot, `go` or `toolchain` in go.mod (no replace); a hash in go.sum. In
+          # package-lock.json removed lines are free (they name nothing to fetch) and each added
+          # one is a known key with a plain value, no backslash (a JSON escape could spell
+          # another key), no `name` (an alias), `link`, `bin` path or `hasInstallScript`, and a
+          # `resolved` is exactly registry.npmjs.org's tarball of its own entry's name and
+          # version. So a dependency can move to another version from its registry, never to
+          # another source or another package.
+          if ! BAD=$(jq -r --arg ecosystems "$ECOSYSTEMS" \
             --arg pin '^[+-](?<same>\s*(-\s+)?uses:\s*["\x27]?[^@\s"\x27]+@)[0-9a-f]{40}["\x27]?(\s+#.*)?$' \
-            --arg rev '^[+-](?<same>\s*rev:\s*)\S+(\s+#.*)?$' '
+            --arg rev '^[+-](?<same>\s*rev:\s*)\S+(\s+#.*)?$' \
+            --arg from '^[+-](?<same>FROM\s+(--platform=\S+\s+)?[a-z0-9][a-z0-9._/-]*(:[0-9]+/[a-z0-9._/-]+)?)(?<tag>:[A-Za-z0-9_][A-Za-z0-9_.-]*)?(?<digest>@sha256:[0-9a-f]{64})?(?<rest>(\s+AS\s+[A-Za-z0-9_.-]+)?\s*)$' \
+            --arg cargo '^[+-](?<same>\s*"?[A-Za-z0-9_.-]+"?\s*=\s*(\{[^"]*\bversion\s*=\s*)?)"(?<req>[^"]*)"(?<rest>.*)$' \
+            --arg creq '^([\^~=]|[<>]=?)?[0-9]+(\.([0-9]+|\*)){0,2}(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' \
+            --arg npm '^[+-](?<same>\s*"[^"]+":\s*)"(?<req>[^"]*)"(?<rest>,?\s*)$' \
+            --arg nreq '^([\^~=]|[<>]=?)?v?[0-9]+(\.([0-9]+|x|\*)){0,2}(-[0-9A-Za-z.-]+)?$' \
+            --arg cargolock '^[+-](\[\[package\]\]|name = "[A-Za-z0-9_.-]+"|version = ("[0-9A-Za-z.+-]+"|[0-9]+)|source = "registry\+https://github\.com/rust-lang/crates\.io-index"|checksum = "[0-9a-f]{64}"|dependencies = \[|\s+"[A-Za-z0-9_.+ -]+( \(registry\+https://github\.com/rust-lang/crates\.io-index\))?",|\]|)$' \
+            --arg gomod '^[+-](\s*(require\s+)?[A-Za-z0-9-]+\.[A-Za-z0-9.-]+(/[A-Za-z0-9._~-]+)*\s+v[0-9][0-9A-Za-z.+-]*(\s+// indirect)?|go [0-9]+(\.[0-9]+){1,2}|toolchain go[0-9]+(\.[0-9]+){1,2}|require \(|\)|\s*)$' \
+            --arg gosum '^[+-][A-Za-z0-9!-]+\.[A-Za-z0-9.!-]+(/[A-Za-z0-9._~!-]+)* v[0-9][0-9A-Za-z.+-]*(/go\.mod)? h1:[A-Za-z0-9+/]{43}=$' \
+            --arg npmkey '^\s*"node_modules/(.*/node_modules/)?(?<name>(@[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+)": \{$' \
+            --arg npmver '^\s*"version": "(?<v>[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)",?$' \
+            --arg npmres '^\s*"resolved": "(?<url>[^"]+)",?$' \
+            --arg npmline '^\s*("[A-Za-z0-9@._/-]*": \{|"(os|cpu|libc|funding)": \[|[}\]],?|"(dev|optional|peer|devOptional)": true,?|"integrity": "sha(256|384|512)-[A-Za-z0-9+/]+=*",?|"license": "[A-Za-z0-9 .()+-]+",?|"(url|funding)": "https://[^" ]+",?|"type": "[A-Za-z]+",?|"deprecated": "[^"]*",?|"[A-Za-z0-9_!-]+",?|"[A-Za-z0-9@._/-]+": "[\^~<>=]*\s*v?[0-9xX*][0-9A-Za-z.*+ |<>=^~-]*",?)$' '
+            ($ecosystems | split(" ") | map(select(. != ""))) as $ecos
+            | def eco($e): $ecos | index($e) != null;
+            # How a file is checked: one for one with a kept part ("pin", "pre-commit", "docker",
+            # "cargo", "npm"), or line by line ("Cargo.lock", "go.mod", "go.sum", "npm-lock").
+            def mode:
+              (split("/") | last) as $base
+              | if . == ".pre-commit-config.yaml" then "pre-commit"
+                elif eco("docker") and ($base | test("^(Dockerfile|Containerfile)([.-][^/]*)?$|\\.(Dockerfile|Containerfile)$")) then "docker"
+                elif eco("cargo") and $base == "Cargo.toml" then "cargo"
+                elif eco("cargo") and $base == "Cargo.lock" then "Cargo.lock"
+                elif eco("gomod") and $base == "go.mod" then "go.mod"
+                elif eco("gomod") and $base == "go.sum" then "go.sum"
+                elif eco("npm") and $base == "package.json" then "npm"
+                elif eco("npm") and $base == "package-lock.json" then "npm-lock"
+                else "pin" end;
+            # A version requirement, kept with everything around it, or null.
+            def requirement($re; $req):
+              if test($re) then capture($re) | if (.req | test($req)) then .same + "\u0000" + .rest else null end
+              else null end;
+            # Whether a changed line of a line-by-line file is one a version update writes.
+            def line_ok($mode):
+              if $mode == "Cargo.lock" then test($cargolock)
+              elif $mode == "go.mod" then test($gomod)
+              else test($gosum) end;
+            # package-lock.json, line by line in order: the first added line that is not one a
+            # version update writes, or null. The entry (its node_modules key and version) is read
+            # from the new side, context included, and forgotten at each hunk header.
+            def npm_lock_bad:
+              reduce split("\n")[] as $line ({name: null, version: null, bad: null};
+                if .bad != null or ($line | startswith("-")) then .
+                elif ($line | startswith("@@")) then .name = null | .version = null
+                else ($line[1:]) as $c
+                  | (if ($c | test($npmkey)) then .name = ($c | capture($npmkey).name) | .version = null
+                     elif ($c | test($npmver)) then .version = ($c | capture($npmver).v)
+                     else . end)
+                  | if ($line | startswith("+") | not) then .
+                    elif ($c | contains("\\")) then .bad = $line
+                    elif ($c | test("^\\s*\"resolved\":")) then
+                      if .name != null and .version != null and ($c | test($npmres))
+                        and ($c | capture($npmres).url)
+                          == "https://registry.npmjs.org/\(.name)/-/\(.name | split("/") | last)-\(.version).tgz"
+                      then . else .bad = $line end
+                    elif ($c | test($npmkey)) or ($c | test($npmver)) or ($c | test($npmline)) then .
+                    else .bad = $line end
+                end)
+              | .bad;
             if (.files | type) != "array" then error("no file list")
             elif (.files | length) >= 300 then error("300 or more files: the list may be truncated")
             else . end
@@ -269,11 +367,26 @@ jobs:
               elif .status != "modified" then "\(.filename | tojson) (\(.status // "?"), not modified)"
               elif (.patch | type) != "string" then "\(.filename | tojson) (no patch: binary or too large)"
               else .filename as $file
+                | ($file | mode) as $mode
                 # What a changed line must keep: everything but the ref and its comment.
                 | def kept:
-                    if test($pin) then "uses " + (capture($pin).same)
-                    elif $file == ".pre-commit-config.yaml" and test($rev) then "rev " + (capture($rev).same)
+                    if $mode == "docker" then
+                      (if test($from) then capture($from)
+                         | if .tag == null and .digest == null then null
+                           else "from " + .same + "\u0000" + .rest + "\u0000" + (.digest != null | tostring) end
+                       else null end)
+                    elif $mode == "cargo" then (requirement($cargo; $creq) | if . then "cargo " + . else null end)
+                    elif $mode == "npm" then (requirement($npm; $nreq) | if . then "npm " + . else null end)
+                    elif test($pin) then "uses " + (capture($pin).same)
+                    elif $mode == "pre-commit" and test($rev) then "rev " + (capture($rev).same)
                     else null end;
+                if $mode == "npm-lock" then
+                  (.patch | npm_lock_bad) as $bad
+                  | if $bad != null then "\($file | tojson): \($bad | tojson)" else empty end
+                elif ($mode | IN("Cargo.lock", "go.mod", "go.sum")) then
+                  [ .patch | split("\n")[] | select(test("^[+-]") and (line_ok($mode) | not))
+                    | "\($file | tojson): \(tojson)" ] | .[0] // empty
+                else
                 # Change blocks: any line that is not a removal or an addition (context, a hunk header,
                 # "\ No newline") ends one, so no pair crosses an unchanged line.
                 [ .patch | split("\n")
@@ -298,11 +411,12 @@ jobs:
                         else empty end
                     end ]
                 | .[0] // empty
+                end
               end' <<<"$COMPARE"); then
             fail "The file list of $LAST_TAG...$SHA is malformed or incomplete. Nothing was released."
           fi
           if [ -n "$BAD" ]; then
-            skip "$LAST_TAG...$SHA changes more than action pins: $(head -n1 <<<"$BAD"). Dispatch the release by hand."
+            skip "$LAST_TAG...$SHA changes more than Dependabot's updates do: $(head -n1 <<<"$BAD"). Dispatch the release by hand."
           fi
 
           if [ "$FIXES" -eq 0 ]; then

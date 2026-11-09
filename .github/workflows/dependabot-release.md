@@ -3,13 +3,16 @@
 Reusable workflow that releases a patch on its own when merging a Dependabot pull request leaves
 nothing but Dependabot's work unreleased. It is meant for a repository whose callers run what it
 ships, such as actions or reusable workflows: a pin bump then reaches them without anyone
-dispatching the release. The caller runs it on every push to the default branch. It decides, and
+dispatching the release. With `ecosystems`, it serves a repository that ships an image or binaries
+too: a base image, crate, Go module or npm bump that Dependabot marks `fix(deps)` ships the same
+way. The caller runs it on every push to the default branch. It decides, and
 tags nothing:
 
 - the push is not the merge of a Dependabot pull request: the jobs are skipped;
 - something other than Dependabot's work is unreleased, or none of it is a `fix`: a green no-op
   with a notice, `release` empty. That release is a human's, dispatched as usual;
-- everything since the last release is Dependabot's, changes only action pins, holds at least one
+- everything since the last release is Dependabot's, changes only what Dependabot's updates change
+  (action pins, and the `ecosystems`' versions), holds at least one
   `fix` and nothing breaking, CI passed on the pushed commit and the default branch has not moved
   on: `release` is `true`, with the next patch as `version` and `tag`;
 - a re-run on the release commit itself: `release` is `true` with that release's version, so
@@ -25,6 +28,7 @@ version, pinned like any other call (see [Usage](#usage)).
 | --- | --- | --- | --- |
 | `tag_prefix` | string | `v` | Text before `X.Y.Z` in the release tag, such as `<plugin>--v`. |
 | `ci_workflow` | string | `ci.yaml` | The CI workflow file in `.github/workflows` that must have passed on the pushed commit. |
+| `ecosystems` | string | `""` | Dependabot ecosystems whose updates may ship besides action pins and pre-commit revs, space-separated: any of `docker`, `cargo`, `gomod`, `npm` (see step 4). Empty: action pins only. |
 
 | Output | Meaning |
 | --- | --- |
@@ -60,11 +64,14 @@ is not what the API documents:
 
    | Commit | Check |
    | --- | --- |
-   | Dependabot's own | one parent; `author.login` is `dependabot[bot]` and `author.type` is `Bot`; `commit.verification.verified` is `true` |
+   | Dependabot's own | one parent; `author.login` is `dependabot[bot]` and `author.type` is `Bot`; `committer.login` is `web-flow` (GitHub created the commit); `commit.verification.verified` is `true` |
    | the merge of a Dependabot pull request | two parents; `commits/{sha}/pulls` lists a pull request whose `merge_commit_sha` is this commit, and `pulls/{number}` has it merged, opened by `dependabot[bot]` (a `Bot`), from a `dependabot/` branch of this repository whose head is the merge's second parent, into this repository's default branch |
 
    An empty pull request list is read again a few times, since the association can lag the push.
-   A commit pushed onto a Dependabot branch, or an "Update branch" merge, is not Dependabot's.
+   A commit pushed onto a Dependabot branch, or an "Update branch" merge, is not Dependabot's. A
+   commit pushed from a clone with Dependabot as its author has its pusher's committer, not
+   `web-flow`. A commit made through the API by someone with write access is committed by
+   `web-flow` too and can name any author: step 4 is what bounds it.
 4. **What it changes.** Step 3 rests on GitHub's attribution, and a commit can borrow it: anyone
    can write Dependabot's address as the git author, and a verified signature authenticates the
    committer, not the author. So the change itself is checked too. Every file in the comparison
@@ -76,6 +83,32 @@ is not what the API documents:
    `.pre-commit-config.yaml`. An added or removed step, another action in a pin's place, or a tag
    instead of a SHA is a human's release, whoever wrote it. A borrowed identity can at most move
    an existing pin.
+
+   Each ecosystem in `ecosystems` admits its files, by name, anywhere in the tree:
+
+   | Ecosystem | Files | Each change |
+   | --- | --- | --- |
+   | `docker` | `Dockerfile`, `Dockerfile.*`, `*.Dockerfile` (and `Containerfile`) | one for one: a `FROM` line, the same image, `--platform` and stage name, another tag or digest; both sides name a tag or a digest (not a bare stage), and a digest is never dropped |
+   | `cargo` | `Cargo.toml` | one for one: the same key, a single version requirement (`"1.2.3"`, `{ version = "^1.2" ... }`) for another |
+   | `cargo` | `Cargo.lock` | line by line: `[[package]]`, `name`, `version`, `checksum`, `dependencies` entries, and a `source` that is crates.io |
+   | `gomod` | `go.mod` | line by line: a requirement on a module path with a dot (`path vX // indirect`), `require (`, `)`, `go`, `toolchain`; no `replace`, `exclude` or `retract` directive |
+   | `gomod` | `go.sum` | line by line: `path vX[/go.mod] h1:<hash>` |
+   | `npm` | `package.json` | one for one: the same key, a single version (`"^7.1.0"`) for another |
+   | `npm` | `package-lock.json` | removed lines are free; each added line is a known key with a plain value (a `node_modules/` entry, `version`, `integrity`, `license`, `dev`/`optional`/`peer`, `engines`, `os`/`cpu`, `funding`, `deprecated`, a dependency range), with no backslash, and a `resolved` is exactly `https://registry.npmjs.org/<name>/-/<base>-<version>.tgz` of the entry it is in. No `name` (an alias), `link`, `bin` or `hasInstallScript` |
+
+   A lockfile (and `go.mod`, which gains indirect requirements) can't be paired line by line, so
+   only its lines' shape is checked: a dependency can move to another version from its registry,
+   never to another source, a local path or, in `package-lock.json`, another package (the entry's
+   own name and version decide its tarball, and a backslash, which could spell another key as a
+   JSON escape, is refused). A line Dependabot would write in another shape (a `bin` entry, an
+   install script flag) is a human's release, as is a lockfile whose patch GitHub omits (too
+   large).
+
+   Accepted limits: a version-shaped value can move on any key of `Cargo.toml` or `package.json`,
+   not only in a dependency table (the crate's own `version`, say), since a patch line does not
+   say which table it is in; and `go.mod` can gain a requirement on a new module, or a line inside
+   an existing `exclude` block, which builds nothing until code imports it. Lowercase `from` / `as`
+   in a Dockerfile are refused, a safe miss.
 5. **Whether it ships.** At least one of Dependabot's commits is a `fix` (`fix(deps): ...`). A
    breaking commit, by a `!` in its subject or a `BREAKING CHANGE:` (or `BREAKING-CHANGE:`)
    footer anywhere in its message, merge commits included, is a human's release.
@@ -158,6 +191,10 @@ jobs:
       pull-requests: read
       actions: read
     uses: leinardi/gh-reusable-workflows/.github/workflows/dependabot-release.yaml@<sha> # v1.x.y
+    # Only for a repository that ships an image or binaries: the ecosystems Dependabot bumps with
+    # fix(deps). Omit it for actions and reusable workflows.
+    # with:
+    #   ecosystems: docker cargo
 
   release:
     needs: dependabot
@@ -183,7 +220,14 @@ responses from a stub `gh` (the highest tag and a custom prefix; one and several
 requests; chore-only, breaking (subject and footer, merges too), human, unverified and pretend-bot
 commits; changes beyond pin bumps (another line, an added or removed step, another action, a
 tag instead of a SHA, a moved, swapped or reordered pin, an added file, no patch, a `rev:` outside
-pre-commit, a truncated list); merges of another
+pre-commit, a truncated list); a Dependabot-authored commit with another committer; per
+ecosystem, the update that ships and what does not (another image or stage, a RUN line, a build
+script, a git dependency or source, a `replace`, a script, a `resolved` elsewhere or a `link`, and
+an ecosystem not listed), and each rule's edge (a changed tail beside a requirement, a version
+beside a git source, a removed lockfile line, an inline `=>`, a `retract`, a short hash, a dropped
+digest or tag, a stage turned image, JSON-escaped keys, another package's tarball, a mismatched or
+orphan `resolved`, an alias, an install script, a git or path spec, a nested scoped entry, a new
+entry); ecosystems split on tabs and newlines; an unknown ecosystem; merges of another
 author's pull request, a fork, another branch or base, an unmerged one, a head that is not the
 second parent, an "Update branch" merge, an octopus; no release yet, a re-run on the release
 commit, behind and diverged comparisons; truncation, API errors and malformed answers), the head
