@@ -44,6 +44,18 @@ on:
         type: string
         required: false
         default: ""
+      base_branch:
+        description: "The trunk a release is cut from (empty: the repository's default branch)"
+        type: string
+        required: false
+        default: ""
+      prerelease:
+        description: >-
+          Publish the release as a pre-release: it never takes the Latest badge, and no vMAJOR or
+          latest tag moves to it. A re-run must pass the same value as the run that published it.
+        type: boolean
+        required: false
+        default: false
     outputs:
       version:
         description: "The released (or, on a dry run, the resolved) release tag, <tag_prefix>X.Y.Z: vX.Y.Z for the default prefix"
@@ -73,16 +85,22 @@ jobs:
 
     steps:
       # workflow_dispatch lets the caller pick any branch. A release is cut from
-      # the default branch only; this fails rather than skips, so a run from
-      # elsewhere is red, not a green no-op.
-      - name: Refuse to release anything but the default branch
+      # the trunk (base_branch, by default the default branch) only; this fails
+      # rather than skips, so a run from elsewhere is red, not a green no-op.
+      - name: Refuse to release anything but the trunk
+        id: guard
         env:
           REF: ${{ github.ref }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_BRANCH: ${{ inputs.base_branch || github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          if [ -z "$DEFAULT_BRANCH" ] || [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
-            echo "A release runs from the default branch (${DEFAULT_BRANCH:-unknown}) only, got $REF. Nothing was changed." >&2
+          if [ -z "$BASE_BRANCH" ] || ! [[ "$BASE_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] \
+            || [[ "$BASE_BRANCH" == *..* || "/$BASE_BRANCH/" == *//* || "/$BASE_BRANCH/" == */.* || "$BASE_BRANCH" == *.lock ]]; then
+            echo "base_branch '$BASE_BRANCH' is not a plain branch name. Nothing was changed." >&2
+            exit 1
+          fi
+          if [ "$REF" != "refs/heads/$BASE_BRANCH" ]; then
+            echo "A release runs from the trunk ($BASE_BRANCH) only, got $REF. Nothing was changed." >&2
             exit 1
           fi
 
@@ -165,7 +183,8 @@ jobs:
       #   no release          -> create a draft, upload, publish
       #   draft               -> check its target, upload what is missing, publish
       #   published           -> check the tag, upload what is missing, no re-publish
-      # A same-name asset whose content differs is never replaced: it fails.
+      # A same-name asset whose content differs is never replaced: it fails, and
+      # so does a published release whose pre-release flag is not `prerelease`.
       - name: Reconcile the GitHub release
         id: reconcile
         env:
@@ -174,6 +193,7 @@ jobs:
           RELEASE_TAG_REGEX: ${{ steps.input.outputs.tag_regex }}
           ASSETS_DIR: ${{ inputs.artifact_name != '' && format('{0}/release-assets', runner.temp) || '' }}
           DRY_RUN: ${{ inputs.dry_run }}
+          PRERELEASE: ${{ inputs.prerelease }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           # git ls-remote of a private repository needs the token; the checkout
@@ -194,8 +214,12 @@ jobs:
           REMOTE_TAGS=$(git ls-remote --tags --refs origin)
           HIGHEST=$({ tag_names "$REMOTE_TAGS"; echo "$VERSION"; } \
             | { grep -E "$RELEASE_TAG_REGEX" || true; } | sort -V | tail -n1)
+          # A pre-release never takes the Latest badge (GitHub never gives it one).
+          if [ "$PRERELEASE" != "true" ]; then
+            PRERELEASE=false
+          fi
           IS_LATEST=false
-          if [ "$HIGHEST" = "$VERSION" ]; then
+          if [ "$HIGHEST" = "$VERSION" ] && [ "$PRERELEASE" = "false" ]; then
             IS_LATEST=true
           fi
 
@@ -215,8 +239,8 @@ jobs:
 
           # Release state: none, draft or published.
           STATE=none
-          if OUT=$(gh release view "$VERSION" --json isDraft,targetCommitish --jq '[.isDraft, .targetCommitish] | @tsv' 2>&1); then
-            IFS=$'\t' read -r IS_DRAFT DRAFT_TARGET <<<"$OUT"
+          if OUT=$(gh release view "$VERSION" --json isDraft,isPrerelease,targetCommitish --jq '[.isDraft, .isPrerelease, .targetCommitish] | @tsv' 2>&1); then
+            IFS=$'\t' read -r IS_DRAFT IS_PRERELEASE DRAFT_TARGET <<<"$OUT"
             if [ "$IS_DRAFT" = "true" ]; then
               STATE=draft
               if [ "$DRAFT_TARGET" != "$TARGET" ]; then
@@ -227,6 +251,10 @@ jobs:
               STATE=published
               if [ -z "$TAG_SHA" ]; then
                 echo "The release $VERSION is published but its tag is missing. Nothing was changed; it needs a human." >&2
+                exit 1
+              fi
+              if [ "$IS_PRERELEASE" != "$PRERELEASE" ]; then
+                echo "The release $VERSION is published with pre-release $IS_PRERELEASE, but this run asks for $PRERELEASE. Nothing was changed; it needs a human." >&2
                 exit 1
               fi
             fi
@@ -290,10 +318,11 @@ jobs:
             fi
           done
 
-          echo "Plan for $VERSION: release state '$STATE', tag ${TAG_SHA:-absent}, target $TARGET, latest=$IS_LATEST, assets to upload: ${MISSING[*]:-none}."
+          echo "Plan for $VERSION: release state '$STATE', tag ${TAG_SHA:-absent}, target $TARGET, latest=$IS_LATEST, prerelease=$PRERELEASE, assets to upload: ${MISSING[*]:-none}."
           {
             echo "state=$STATE"
             echo "is_latest=$IS_LATEST"
+            echo "prerelease=$PRERELEASE"
             echo "uploaded=${MISSING[*]}"
           } >> "$GITHUB_OUTPUT"
           if [ "$DRY_RUN" = "true" ]; then
@@ -302,7 +331,8 @@ jobs:
           fi
 
           if [ "$STATE" = "none" ]; then
-            gh release create "$VERSION" --draft --target "$TARGET" --title "$VERSION" --generate-notes --latest="$IS_LATEST"
+            gh release create "$VERSION" --draft --target "$TARGET" --title "$VERSION" --generate-notes \
+              --latest="$IS_LATEST" --prerelease="$PRERELEASE"
             STATE=draft
           fi
           for name in "${MISSING[@]}"; do
@@ -310,7 +340,7 @@ jobs:
           done
           if [ "$STATE" = "draft" ]; then
             # Publishing creates the tag on the target: the point of no return.
-            gh release edit "$VERSION" --draft=false --latest="$IS_LATEST"
+            gh release edit "$VERSION" --draft=false --latest="$IS_LATEST" --prerelease="$PRERELEASE"
           fi
 
           TAG_SHA=$(remote_tag_sha "$VERSION")
@@ -335,7 +365,7 @@ jobs:
           fi
           if [ "$IS_LATEST" = "true" ] && [ "$CURRENT_LATEST" != "$VERSION" ]; then
             gh release edit "$VERSION" --latest
-          elif [ "$IS_LATEST" != "true" ] && [ "$CURRENT_LATEST" = "$VERSION" ]; then
+          elif [ "$IS_LATEST" != "true" ] && [ "$CURRENT_LATEST" = "$VERSION" ] && [ "$HIGHEST" != "$VERSION" ]; then
             gh release edit "$HIGHEST" --latest \
               || echo "::warning::$VERSION carries the Latest badge but $HIGHEST is higher, and $HIGHEST could not be marked Latest. Mark it by hand."
           fi
@@ -348,11 +378,13 @@ jobs:
       # Only the default `v` prefix has moving tags. Another prefix moves none:
       # `latest` is one tag per repository, so two prefixes would fight over it,
       # and the "Immutable tags" ruleset exempts only `v<N>` and `latest`, so a
-      # `<prefix>MAJOR` could be created once and then never moved.
+      # `<prefix>MAJOR` could be created once and then never moved. A pre-release
+      # moves neither: both stand for the newest stable release.
       - name: Move the major and latest tags
         id: aliases
         if: ${{ !inputs.dry_run }}
         env:
+          PRERELEASE: ${{ inputs.prerelease }}
           VERSION: ${{ steps.resolve.outputs.tag }}
           MAJOR: ${{ steps.resolve.outputs.major }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
@@ -366,6 +398,11 @@ jobs:
           GIT_CONFIG_VALUE_0: '!f() { if [ "$1" = get ]; then echo username=x-access-token; echo "password=$GH_TOKEN"; fi; }; f'
         run: |
           set -euo pipefail
+          if [ "$PRERELEASE" = "true" ]; then
+            echo "::notice::$VERSION is a pre-release: no vMAJOR or latest tag is moved."
+            echo "moved=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$TAG_PREFIX" != "v" ]; then
             echo "::notice::The tag prefix is '$TAG_PREFIX', not 'v': no vMAJOR or latest tag is moved."
             echo "moved=" >> "$GITHUB_OUTPUT"
@@ -414,6 +451,7 @@ jobs:
           RECOVERY: ${{ steps.resolve.outputs.recovery }}
           STATE: ${{ steps.reconcile.outputs.state }}
           IS_LATEST: ${{ steps.reconcile.outputs.is_latest }}
+          PRERELEASE: ${{ steps.reconcile.outputs.prerelease }}
           UPLOADED: ${{ steps.reconcile.outputs.uploaded }}
           MOVED: ${{ steps.aliases.outputs.moved }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -427,7 +465,7 @@ jobs:
             fi
             echo
             echo "- Previous release: ${PREVIOUS:-none}; explicit version: $EXPLICIT; recovery: $RECOVERY"
-            echo "- Release state found: ${STATE:-unknown}; marked latest: ${IS_LATEST:-unknown}"
+            echo "- Release state found: ${STATE:-unknown}; marked latest: ${IS_LATEST:-unknown}; pre-release: ${PRERELEASE:-unknown}"
             echo "- Assets uploaded: ${UPLOADED:-none}"
             echo "- Tags moved: ${MOVED:-none}"
           } >> "$GITHUB_STEP_SUMMARY"

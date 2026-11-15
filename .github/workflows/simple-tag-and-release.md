@@ -27,6 +27,8 @@ action, and svu is installed by
 | `tag_prefix` | string | `v` | The text before `X.Y.Z` in a release tag: `v`, or `<plugin>--v` for a plugin tagged `<plugin>--vX.Y.Z`. Letters, digits and `.`, `_`, `/`, `-` only. See [Tag prefixes](#tag-prefixes). |
 | `dry_run` | boolean | `false` | Resolve the version and print what would happen; change nothing. |
 | `artifact_name` | string | `""` | An artifact uploaded earlier in the calling run. Its files are attached to the release; it must hold top-level files only. |
+| `base_branch` | string | `""` | The trunk a release is cut from. Empty: the repository's default branch. |
+| `prerelease` | boolean | `false` | Publish a pre-release: it never takes the *Latest* badge and moves no `vMAJOR` or `latest` tag. A re-run must pass the same value: a published release whose flag differs fails. |
 | `semver` | string | `""` | Deprecated alias of `version`, kept for existing callers. Setting both to different versions fails. |
 
 | Output | Meaning |
@@ -34,8 +36,8 @@ action, and svu is installed by
 | `version` | The released (or, on a dry run, resolved) tag, `<tag_prefix>X.Y.Z`: `vX.Y.Z` for the default prefix. |
 | `tag` | The same tag, under a name that says what it is. |
 
-The caller must grant `contents: write`. The run fails unless it was started from the repository's
-default branch (a dispatch from it, or a push to it).
+The caller must grant `contents: write`. The run fails unless it was started from the trunk
+(`base_branch`, by default the repository's default branch): a dispatch from it, or a push to it.
 
 ## Versions
 
@@ -92,17 +94,21 @@ to whichever prefix released its highest version last.
     - a draft (from a run that failed before publishing): checks its target, uploads the missing
       files, publishes it;
     - a published release (from a run that failed after publishing): uploads the missing files;
-      nothing is re-published.
+      nothing is re-published. Its pre-release flag must equal `prerelease`, or it needs a
+      human.
 
    A file already on the release with different content is never replaced: the run fails and it
    needs a human. So does a file on the release that the artifact does not contain. Publishing
    creates the tag, so everything that can fail runs before the tag exists. That matters where tags
    are immutable: a failed run leaves at most a draft, never an orphan tag.
-5. Marks the release GitHub's *Latest* only when it is the highest release of its prefix, so
-   recovering an older version never takes the badge. Failing to read which release carries the
-   badge fails the run (a re-run finishes it); only "no release is Latest yet" reads as none.
-6. For the `v` prefix only, moves `vMAJOR` to the release when it is the highest of its major, and
-   `latest` when it is the highest overall. Both are updated in place and never move backwards.
+5. Marks the release GitHub's *Latest* only when it is the highest release of its prefix and not
+   a pre-release, so recovering an older version never takes the badge. Failing to read which
+   release carries the badge fails the run (a re-run finishes it); only "no release is Latest yet"
+   reads as none.
+6. For the `v` prefix only, and never for a pre-release, moves `vMAJOR` to the release when it is
+   the highest of its major, and `latest` when it is the highest overall. Both are updated in place
+   and never move backwards. A pre-release tag still counts as a release when deciding the highest:
+   a stable release below a published pre-release takes neither badge nor `latest`.
 
 A dry run stops after step 4 has printed its plan: no draft, no upload, no tag.
 

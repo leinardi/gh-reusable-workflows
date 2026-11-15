@@ -46,10 +46,11 @@ trap 'rm -rf "$WORK"' EXIT
 wf() { yq -r "$1" "$WORKFLOW"; }
 step_run() { wf ".jobs.release.steps[] | select(.id == \"$1\") | .run" >"$WORK/$1.sh"; }
 
+step_run guard
 step_run input
 step_run reconcile
 step_run aliases
-for step in input reconcile aliases; do
+for step in guard input reconcile aliases; do
 	if [ ! -s "$WORK/$step.sh" ]; then
 		echo "no step with id '$step' in $WORKFLOW" >&2
 		exit 1
@@ -59,6 +60,7 @@ done
 # The gh stub. State lives under $GH_STUB_DIR:
 #   releases/<tag>/draft   "true" or "false"
 #   releases/<tag>/target  the target commit
+#   releases/<tag>/prerelease "true" or "false"
 #   releases/<tag>/assets/ the uploaded files
 #   latest                 the tag carrying the Latest badge
 #   latest_fail            if present, reading the Latest release fails with it
@@ -74,23 +76,28 @@ case "$1 $2" in
 	tag=$3
 	[ -d "$rel/$tag" ] || { echo "release not found" >&2; exit 1; }
 	case "$*" in
-	*isDraft,targetCommitish*) printf '%s\t%s\n' "$(cat "$rel/$tag/draft")" "$(cat "$rel/$tag/target")" ;;
+	*isDraft,isPrerelease,targetCommitish*)
+		printf '%s\t%s\t%s\n' "$(cat "$rel/$tag/draft")" "$(cat "$rel/$tag/prerelease")" "$(cat "$rel/$tag/target")"
+		;;
 	*assets*) ls -1 "$rel/$tag/assets" ;;
 	esac
 	;;
 "release create")
 	tag=$3
 	shift 3
-	target=""
+	target="" prerelease=false
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 		--target) target=$2; shift 2 ;;
+		--prerelease=*) prerelease=${1#--prerelease=}; shift ;;
+		--prerelease) prerelease=true; shift ;;
 		*) shift ;;
 		esac
 	done
 	mkdir -p "$rel/$tag/assets"
 	echo true >"$rel/$tag/draft"
 	echo "$target" >"$rel/$tag/target"
+	echo "$prerelease" >"$rel/$tag/prerelease"
 	;;
 "release upload")
 	[ -e "$rel/$3/assets/$(basename "$4")" ] && { echo "asset exists" >&2; exit 1; }
@@ -119,6 +126,7 @@ case "$1 $2" in
 			git -C "$GH_STUB_ORIGIN" tag "$tag" "$(cat "$rel/$tag/target")"
 			;;
 		--latest | --latest=true) echo "$tag" >"$GH_STUB_DIR/latest" ;;
+		--prerelease=*) echo "${arg#--prerelease=}" >"$rel/$tag/prerelease" ;;
 		esac
 	done
 	;;
@@ -227,6 +235,29 @@ regex_for() {
 # the step scripts test it (grep -E).
 matches() { grep -qE "$1" <<<"$2"; }
 
+echo "# guard"
+
+guard() { run_step guard REF="$1" BASE_BRANCH="$2"; }
+new_repo
+guard refs/heads/main main
+if [ "$STATUS" -eq 0 ]; then ok "a run from the trunk passes the guard"; else not_ok "a run from the trunk passes the guard" "$LOG"; fi
+guard refs/heads/rust-rewrite rust-rewrite
+if [ "$STATUS" -eq 0 ]; then ok "a run from base_branch passes the guard"; else not_ok "a run from base_branch passes the guard" "$LOG"; fi
+guard refs/heads/master rust-rewrite
+expect_fail "a run from the default branch is refused when base_branch names another trunk" "from the trunk (rust-rewrite) only"
+guard refs/heads/feature main
+expect_fail "a run from another branch is refused" "from the trunk (main) only"
+for bad in "" "a b" "../main" "a..b" "/main" "main/" "a//b" ".hidden" "x/.y" "main.lock" "a\$b"; do
+	guard "refs/heads/$bad" "$bad"
+	expect_fail "the trunk name '$bad' is refused" "not a plain branch name"
+done
+BASE_EXPR=$(wf '.jobs.release.steps[] | select(.id == "guard") | .env.BASE_BRANCH')
+if [ "$BASE_EXPR" = "\${{ inputs.base_branch || github.event.repository.default_branch }}" ]; then
+	ok "the trunk defaults to the default branch"
+else
+	not_ok "the trunk defaults to the default branch" "$BASE_EXPR"
+fi
+
 echo "# svu"
 
 # svu only derives a version. An explicit one must not depend on downloading it,
@@ -284,7 +315,7 @@ echo two >"$ASSETS/b.txt"
 
 reconcile() {
 	run_step reconcile VERSION="$1" TARGET="$(git -C "$REPO" rev-parse HEAD)" ASSETS_DIR="${2:-}" DRY_RUN="${3:-false}" REPO=leinardi/test \
-		RELEASE_TAG_REGEX="${REGEX:-$V_REGEX}"
+		RELEASE_TAG_REGEX="${REGEX:-$V_REGEX}" PRERELEASE="${PRERELEASE:-false}"
 }
 calls() { cat "$GH_STUB_DIR/calls"; }
 writes() { grep -E '^release (create|upload|edit)|^api -X' "$GH_STUB_DIR/calls" || true; }
@@ -488,7 +519,7 @@ echo "# aliases"
 
 aliases() {
 	run_step aliases VERSION="$1" MAJOR="$2" TARGET="$(git -C "$REPO" rev-parse HEAD)" REPO=leinardi/test \
-		TAG_PREFIX="${PREFIX:-v}" RELEASE_TAG_REGEX="${REGEX:-$V_REGEX}"
+		TAG_PREFIX="${PREFIX:-v}" RELEASE_TAG_REGEX="${REGEX:-$V_REGEX}" PRERELEASE="${PRERELEASE:-false}"
 }
 
 new_repo
@@ -598,6 +629,109 @@ if [ "$STATUS" -eq 0 ] && [ "$(remote_tag latest)" = "$(git -C "$REPO" rev-parse
 	ok "prefix v: another prefix's higher tag does not keep latest"
 else
 	not_ok "prefix v: another prefix's higher tag does not keep latest" "$LOG$(calls)"
+fi
+
+echo "# prerelease"
+
+new_repo
+release_tag v0.7.0
+commit "fix(core): a fix"
+push_head
+PRERELEASE=true reconcile v0.99.0 "$ASSETS"
+if [ "$STATUS" -eq 0 ] && [ "$(cat "$GH_STUB_DIR/releases/v0.99.0/prerelease")" = true ] \
+	&& [ "$(cat "$GH_STUB_DIR/releases/v0.99.0/draft")" = false ] \
+	&& [ "$(remote_tag v0.99.0)" = "$(git -C "$REPO" rev-parse HEAD)" ] \
+	&& [ ! -s "$GH_STUB_DIR/latest" ] && [ "$(out is_latest)" = false ] && [ "$(out prerelease)" = true ]; then
+	ok "a pre-release is published as one and never takes the Latest badge, even as the highest"
+else
+	not_ok "a pre-release is published as one and never takes the Latest badge, even as the highest" "$LOG$(calls)"
+fi
+: >"$GH_STUB_DIR/calls"
+PRERELEASE=true reconcile v0.99.0 "$ASSETS"
+if [ "$STATUS" -eq 0 ] && [ -z "$(writes)" ]; then ok "re-running a complete pre-release is a no-op"; else not_ok "re-running a complete pre-release is a no-op" "$LOG$(calls)"; fi
+reconcile v0.99.0 "$ASSETS"
+expect_fail "a published pre-release re-run as a stable release needs a human" "published with pre-release true"
+
+new_repo
+release_tag v1.2.0
+commit "fix(core): a fix"
+push_head
+reconcile v1.2.1 "$ASSETS"
+PRERELEASE=true reconcile v1.2.1 "$ASSETS"
+expect_fail "a published stable release re-run as a pre-release needs a human" "published with pre-release false"
+
+new_repo
+release_tag v0.7.0
+commit "fix(core): a fix"
+push_head
+gh release create v0.99.0 --draft --target "$(git -C "$REPO" rev-parse HEAD)" >/dev/null
+PRERELEASE=true reconcile v0.99.0 "$ASSETS"
+if [ "$STATUS" -eq 0 ] && grep -q '^release edit v0.99.0 --draft=false --latest=false --prerelease=true' "$GH_STUB_DIR/calls" \
+	&& [ "$(cat "$GH_STUB_DIR/releases/v0.99.0/prerelease")" = true ]; then
+	ok "a draft is published as a pre-release"
+else
+	not_ok "a draft is published as a pre-release" "$LOG$(calls)"
+fi
+
+new_repo
+release_tag v0.7.0
+git -C "$ORIGIN" tag v0 "$(git -C "$REPO" rev-parse HEAD)"
+git -C "$ORIGIN" tag latest "$(git -C "$REPO" rev-parse HEAD)"
+commit "fix(core): a fix"
+release_tag v0.99.0
+PRERELEASE=true aliases v0.99.0 v0
+if [ "$STATUS" -eq 0 ] && [ -z "$(writes)" ] && [ -z "$(out moved)" ] \
+	&& [ "$(remote_tag v0)" = "$(git -C "$REPO" rev-parse HEAD~1)" ] \
+	&& [ "$(remote_tag latest)" = "$(git -C "$REPO" rev-parse HEAD~1)" ] \
+	&& grep -q "is a pre-release: no vMAJOR or latest tag is moved" <<<"$LOG"; then
+	ok "a pre-release moves neither vMAJOR nor latest"
+else
+	not_ok "a pre-release moves neither vMAJOR nor latest" "$LOG$(calls)"
+fi
+
+# A stable release below a published pre-release: the pre-release still counts as the highest, so
+# the stable one takes neither the badge nor latest, but does take its own vMAJOR.
+new_repo
+release_tag v1.5.0
+git -C "$ORIGIN" tag v1 "$(git -C "$REPO" rev-parse HEAD)"
+git -C "$ORIGIN" tag latest "$(git -C "$REPO" rev-parse HEAD)"
+echo v1.5.0 >"$GH_STUB_DIR/latest"
+commit "feat(api)!: the next major"
+release_tag v2.0.0
+git -C "$REPO" checkout -q HEAD~1
+commit "fix(core): a backported fix"
+push_head
+reconcile v1.5.1 "$ASSETS"
+STABLE_LOG=$LOG STABLE_STATUS=$STATUS STABLE_LATEST=$(out is_latest)
+aliases v1.5.1 v1
+if [ "$STABLE_STATUS" -eq 0 ] && [ "$STABLE_LATEST" = false ] && [ "$(cat "$GH_STUB_DIR/latest")" = v1.5.0 ] \
+	&& [ "$STATUS" -eq 0 ] && [ "$(remote_tag v1)" = "$(git -C "$REPO" rev-parse HEAD)" ] \
+	&& [ "$(remote_tag latest)" = "$(git -C "$REPO" rev-parse v1.5.0)" ]; then
+	ok "a stable release below a published pre-release moves vMAJOR but takes neither the badge nor latest"
+else
+	not_ok "a stable release below a published pre-release moves vMAJOR but takes neither the badge nor latest" "$STABLE_LOG$LOG$(calls)"
+fi
+
+# A pre-release that is the highest while the Latest lookup names it (GitHub never does, but the
+# hand-back must not loop onto the release itself): no `--latest` edit at all.
+new_repo
+release_tag v0.7.0
+commit "fix(core): a fix"
+push_head
+echo v0.99.0 >"$GH_STUB_DIR/latest"
+PRERELEASE=true reconcile v0.99.0 "$ASSETS"
+if [ "$STATUS" -eq 0 ] && ! grep -qE '^release edit .*--latest( |$)' "$GH_STUB_DIR/calls"; then
+	ok "a pre-release named by the Latest lookup is not handed the badge"
+else
+	not_ok "a pre-release named by the Latest lookup is not handed the badge" "$LOG$(calls)"
+fi
+
+PRE_IF=$(wf '.jobs.release.steps[] | select(.id == "reconcile") | .env.PRERELEASE')
+PRE_ALIASES=$(wf '.jobs.release.steps[] | select(.id == "aliases") | .env.PRERELEASE')
+if [ "$PRE_IF" = "\${{ inputs.prerelease }}" ] && [ "$PRE_ALIASES" = "\${{ inputs.prerelease }}" ]; then
+	ok "the reconcile and moving-tag steps both read the prerelease input"
+else
+	not_ok "the reconcile and moving-tag steps both read the prerelease input" "$PRE_IF / $PRE_ALIASES"
 fi
 
 echo

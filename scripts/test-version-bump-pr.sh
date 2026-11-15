@@ -59,6 +59,9 @@ extract bump current
 extract bump bump
 extract bump export
 extract publish publish
+# The two jobs' guards are checked to be the same script below; the bump job's is the one run.
+wf '.jobs.bump.steps[] | select(.id == "guard") | .run' >"$WORK/guard.sh"
+wf '.jobs.publish.steps[] | select(.id == "guard") | .run' >"$WORK/publish-guard.sh"
 
 # The gh stub. State lives under $GH_STUB_DIR:
 #   refs.json   the array `git/matching-refs/tags/<tag>` returns ([] when absent)
@@ -216,7 +219,7 @@ bump_job() {
 	[ "$STATUS" -eq 0 ] || { not_ok "setup: the patch export succeeds" "$LOG"; return 1; }
 }
 publish() {
-	RUN_IN="$PUB" run_step publish DRY_RUN="${1:-false}" REPO=leinardi/test DEFAULT_BRANCH=main BASE_SHA="$HEAD_SHA" \
+	RUN_IN="$PUB" run_step publish DRY_RUN="${1:-false}" REPO=leinardi/test BASE_BRANCH="${BASE-main}" BASE_SHA="$HEAD_SHA" \
 		VERSION="${VERSION_OUT-1.2.1}" TAG="${TAG_OUT-v1.2.1}" TAG_PREFIX="${PREFIX:-v}" \
 		ALLOWED_FILES="${PUB_ALLOWED-VERSION}" CI_WORKFLOW="${PUB_CI-ci.yaml}" PATCH="$PATCH" GH_TOKEN=stub
 }
@@ -226,6 +229,62 @@ pr() {
 		'{number: $n, head: {repo: (if $repo == "" then null else {full_name: $repo} end), ref: $ref}, user: {login: $login}}'
 }
 bot_pr() { pr "${1:-7}" leinardi/test "${2:-release/v1.2.1}" 'github-actions[bot]' | jq -s . >"$GH_STUB_DIR/pulls.json"; }
+
+check() {
+	if [ "$2" = "$3" ]; then ok "$1"; else not_ok "$1" "want: $3
+got:  $2"; fi
+}
+
+echo "# guard"
+
+guard() { run_step guard REF="$1" BASE_BRANCH="$2" DRY_RUN="${3:-false}"; }
+check_same() {
+	if [ -s "$WORK/guard.sh" ] && cmp -s "$WORK/guard.sh" "$WORK/publish-guard.sh" \
+		&& [ "$(wf '.jobs.bump.steps[0].id + " " + .jobs.publish.steps[0].id')" = "guard guard" ] \
+		&& [ "$(wf '.jobs.bump.steps[0].env | tojson')" = "$(wf '.jobs.publish.steps[0].env | tojson')" ]; then
+		ok "both jobs start with the same guard, on the same inputs"
+	else
+		not_ok "both jobs start with the same guard, on the same inputs"
+	fi
+}
+check_same
+RUN_IN=$WORK
+guard refs/heads/main main
+if [ "$STATUS" -eq 0 ]; then ok "a real run from the trunk passes"; else not_ok "a real run from the trunk passes" "$LOG"; fi
+guard refs/heads/rust-rewrite rust-rewrite
+if [ "$STATUS" -eq 0 ]; then ok "a real run from base_branch passes"; else not_ok "a real run from base_branch passes" "$LOG"; fi
+guard refs/heads/master rust-rewrite
+expect_fail "a real run from the default branch is refused when base_branch names another trunk" "from the trunk (rust-rewrite) only"
+guard refs/heads/m8/release rust-rewrite
+expect_fail "an off-trunk real run is refused" "only a dry run may run elsewhere"
+guard refs/heads/m8/release rust-rewrite true
+if [ "$STATUS" -eq 0 ] && grep -q "Dry run from refs/heads/m8/release, not the trunk rust-rewrite" <<<"$LOG"; then
+	ok "an off-trunk dry run is accepted, with a notice"
+else
+	not_ok "an off-trunk dry run is accepted, with a notice" "$LOG"
+fi
+for bad in "" "a b" "a..b" "main/" ".x" "main.lock"; do
+	guard refs/heads/main "$bad" true
+	expect_fail "the trunk name '$bad' is refused, even on a dry run" "not a plain branch name"
+done
+unset RUN_IN
+check "the trunk defaults to the default branch" "$(wf '.jobs.bump.steps[0].env.BASE_BRANCH')" \
+	"\${{ inputs.base_branch || github.event.repository.default_branch }}"
+check "publish reads the same trunk" "$(wf '.jobs.publish.steps[] | select(.id == "publish") | .env.BASE_BRANCH')" \
+	"\${{ inputs.base_branch || github.event.repository.default_branch }}"
+# A dry run resolves and bumps exactly as a real run: no bump-job step is skipped on it. The
+# resolution itself is the pinned release-version action's, tested in gh-composite-actions at
+# addc113a34e0a96ca2e08218380fdecad2fdd230 (v1.4.2), release-version/release-version.test.sh:
+# "feat derives a minor" (v1.2.0 + feat, empty input: v1.3.0) and "only chore/docs commits:
+# nothing to bump" (v1.2.0 + chore and docs, empty input: fails "nothing to bump").
+check "the version is resolved by the pinned release-version, on every run" \
+	"$(wf '.jobs.bump.steps[] | select(.id == "resolve") | .uses + " " + (.if // "always") + " " + .with.version')" \
+	"leinardi/gh-composite-actions/release-version@addc113a34e0a96ca2e08218380fdecad2fdd230 always \${{ inputs.version }}"
+check "no bump-job step depends on dry_run" \
+	"$(wf '[.jobs.bump.steps[] | select((.if // "") | test("dry_run"))] | length')" "0"
+check "the patch artifact is uploaded on every run" \
+	"$(wf '.jobs.bump.steps[] | select((.uses // "") | test("^actions/upload-artifact@")) | (.if // "always") + " " + .with.name')" \
+	"always version-bump-pr-patch"
 
 echo "# svu"
 
@@ -383,10 +442,6 @@ if [ "$STATUS" -eq 0 ] && grep -q '^+1.2.1' "$PATCH"; then ok "the export ignore
 
 echo "# job boundaries"
 
-check() {
-	if [ "$2" = "$3" ]; then ok "$1"; else not_ok "$1" "want: $3
-got:  $2"; fi
-}
 check "the bump job's token is read-only" "$(wf '.jobs.bump.permissions | to_entries | map(.key + ":" + .value) | join(" ")')" "contents:read"
 check "the bump job's steps get no token" "$(wf '[.jobs.bump.steps[] | .env // {} | keys[] | select(test("TOKEN"))] | length')" "0"
 check "the bump job's checkout persists no credential" \
@@ -434,6 +489,21 @@ if [ "$STATUS" -eq 0 ] && [ "$(remote_refs)" = "$BEFORE" ] && [ -z "$(writes)" ]
 	ok "dry run: prints the diff and the plan; no branch, no commit, no PR, no dispatch"
 else
 	not_ok "dry run: prints the diff and the plan; no branch, no commit, no PR, no dispatch" "$LOG$(calls)"
+fi
+if [ "$(out version)" = 1.2.1 ] && [ "$(out tag)" = v1.2.1 ] && [ "$(out branch)" = release/v1.2.1 ] && [ -z "$(out pull_request)" ]; then
+	ok "dry run: the version, tag and branch outputs are set, the pull request is not"
+else
+	not_ok "dry run: the version, tag and branch outputs are set, the pull request is not" "$OUTPUT"
+fi
+
+new_repo
+bump_job 1.2.1
+BASE=rust-rewrite publish
+if [ "$STATUS" -eq 0 ] && grep -q '^pr create --repo leinardi/test --base rust-rewrite --head release/v1.2.1 ' "$GH_STUB_DIR/calls" \
+	&& grep -q -- '-f state=open -f base=rust-rewrite -f head=leinardi:release/v1.2.1' "$GH_STUB_DIR/calls"; then
+	ok "base_branch: the open pull requests are read from it and the pull request opened into it"
+else
+	not_ok "base_branch: the open pull requests are read from it and the pull request opened into it" "$LOG$(calls)"
 fi
 
 # An open PR whose branch is exactly this bump on this commit: reused as it is.
