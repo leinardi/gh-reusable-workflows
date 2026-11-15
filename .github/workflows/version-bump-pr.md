@@ -8,9 +8,9 @@ never tags. It:
    `<tag_prefix>X.Y.Z` tag, higher than the version the repository already carries;
 2. runs the repository's own bump command, and checks that it changed only the allowed files;
 3. pushes the result as one commit, authored and committed by `github-actions[bot]`, on
-   `release/<tag>`, cut from the dispatched default-branch commit;
-4. opens a pull request into the default branch with `GITHUB_TOKEN`, and dispatches CI on the
-   branch.
+   `release/<tag>`, cut from the dispatched commit of the trunk (`base_branch`, by default the
+   default branch);
+4. opens a pull request into the trunk with `GITHUB_TOKEN`, and dispatches CI on the branch.
 
 Merging that pull request with a merge commit is the release:
 [`release-on-merge`](release-on-merge.md) authorizes it and waits for CI on the merge commit, and
@@ -47,6 +47,7 @@ nothing from it unchecked:
 | `bump_command` | string | required | Writes the new version (see below). |
 | `allowed_files` | string | required | The files the bump may change, relative to the root, separated by spaces or newlines. Give `release-on-merge` the same list. |
 | `ci_workflow` | string | `ci.yaml` | The workflow file in `.github/workflows` dispatched on the bump branch. |
+| `base_branch` | string | `""` | The trunk the bump branch is cut from and its pull request targets. Empty: the repository's default branch. For a repository whose trunk is not (yet) its default branch. |
 
 | Output | Meaning |
 | --- | --- |
@@ -57,8 +58,15 @@ nothing from it unchecked:
 
 The calling job grants the union of both jobs: `contents: write`, `pull-requests: write`,
 `actions: write`. The repository must allow GitHub Actions to create pull requests (Settings,
-Actions, "Allow GitHub Actions to create and approve pull requests"). Both jobs fail unless the
-run was dispatched from the default branch.
+Actions, "Allow GitHub Actions to create and approve pull requests"). A real run fails in both jobs
+unless it was dispatched from the trunk (`base_branch`, by default the default branch).
+
+A dry run may be dispatched from any ref, a pull request branch for example, to check a bump before
+it lands. It runs the `bump` job exactly as a real run (the version resolved by `release-version`,
+svu included, then `version_command` and `bump_command`), uploads the patch artifact, and sets the
+`version`, `tag` and `branch` outputs, so the caller can apply the patch in a later job and build
+the bumped tree. Its `publish` job still holds the write grants but pushes, opens and dispatches
+nothing.
 
 ## The commands
 
@@ -87,7 +95,7 @@ The `publish` job reads the remote once, then acts:
 | --- | --- |
 | The tag `<tag>` exists | Fail: that version is released, or its release is in progress. |
 | An open pull request from this repository's `release/<tag>`, opened by `github-actions[bot]`, whose branch is exactly this bump (one commit on the dispatched commit, same tree, authored and committed by `github-actions[bot]`) | Reuse it and dispatch CI on it again. |
-| Such a pull request whose branch is anything else (the default branch moved on, "Update branch" added a merge, someone pushed, or recommitted the bump as themselves) | Push this bump onto the branch, replacing what is there, and dispatch CI. The pull request stays open. |
+| Such a pull request whose branch is anything else (the trunk moved on, "Update branch" added a merge, someone pushed, or recommitted the bump as themselves) | Push this bump onto the branch, replacing what is there, and dispatch CI. The pull request stays open. |
 | An open pull request on the branch opened by anyone else, or two of them, or one whose branch is gone | Fail: it needs a human. |
 | No open pull request (no branch, or one a failed run left) | Push this bump, open the pull request, dispatch CI. |
 

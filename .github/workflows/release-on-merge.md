@@ -2,7 +2,8 @@
 
 Reusable workflow for the second half of a release in a repository that commits its version
 ([`version-bump-pr`](version-bump-pr.md) is the first). The caller runs it on every push to the
-default branch that touches the version file. It decides, and tags nothing:
+trunk (`base_branch`, by default the default branch) that touches the version file. It decides,
+and tags nothing:
 
 - the version did not change: a green no-op, `release` empty;
 - the push is the merge of version-bump-pr's pull request for exactly the version it now carries,
@@ -21,6 +22,8 @@ tag, pinned like any other call (see [Usage](#usage)).
 | `allowed_files` | string | required | The files a release may change, separated by spaces or newlines: version-bump-pr's list. |
 | `tag_prefix` | string | `v` | Text before `X.Y.Z` in the release tag, such as `<plugin>--v`. |
 | `ci_workflow` | string | `ci.yaml` | The CI workflow file in `.github/workflows` that must have passed on the merge commit. |
+| `base_branch` | string | `""` | The trunk: the push must be to it and the pull request merged into it. Empty: the repository's default branch. Give version-bump-pr the same one. |
+| `ci_timeout_minutes` | number | `30` | Minutes to wait for `ci_workflow` on the merge commit, 1 to 350; the `ci` job's own timeout is this plus 10. Anything else fails the `authorize` job. |
 
 | Output | Meaning |
 | --- | --- |
@@ -82,7 +85,7 @@ answer that is not what the API documents:
    | --- | --- |
    | merged | `merged` is `true` and `merged_at` is set |
    | by exactly this commit | `merge_commit_sha` equals the pushed SHA |
-   | into this repository's default branch | `base.ref`, `base.repo.full_name` |
+   | into this repository's trunk | `base.ref`, `base.repo.full_name` |
    | from this repository, not a fork | `head.repo.full_name` (a deleted fork's is `null`: refused) |
    | from the bump branch of exactly this version | `head.ref` is `release/<tag_prefix><version>` |
    | opened by version-bump-pr | `user.login` is `github-actions[bot]`, `user.type` is `Bot` |
@@ -100,8 +103,9 @@ commits), so nothing can be edited between this check and the tag.
 
 ### ci
 
-`require-ci-green` waits, up to 30 minutes, for the newest run of `.github/workflows/<ci_workflow>`
-on the pushed SHA, triggered by the `push` to the default branch, and requires its `ci-result` job
+`require-ci-green` waits, up to `ci_timeout_minutes` (30 by default), for the newest run of
+`.github/workflows/<ci_workflow>` on the pushed SHA, triggered by the `push` to the trunk, and
+requires its `ci-result` job
 to succeed. Only then does the job set `release=true`. A CI workflow whose `push` trigger skips the
 merge (a `paths:` filter, a branch filter) leaves no run to find, and the gate times out.
 

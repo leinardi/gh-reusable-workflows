@@ -1,7 +1,7 @@
 name: Release on merge (reusable)
 
 # The second half of a release for a repository that commits its version (version-bump-pr.yaml is
-# the first). On a push to the default branch, decide whether the push is the merge of
+# the first). On a push to the trunk, decide whether the push is the merge of
 # version-bump-pr's pull request for the version it now carries, and whether CI passed on it. It
 # tags nothing: the caller's next job calls simple-tag-and-release when the `release` output is
 # true, so that call is pinned in the caller like any other.
@@ -14,7 +14,8 @@ name: Release on merge (reusable)
 #              one bot commit; the commit and the merge change only allowed_files.
 #   ci         require-ci-green on the merge commit; sets release=true only when it passed.
 #
-# The caller runs it on `push` to the default branch, with `paths:` naming the version file.
+# The caller runs it on `push` to the trunk (base_branch, by default the default branch), with
+# `paths:` naming the version file.
 #
 # The inline scripts are tested by scripts/test-release-on-merge.sh, which extracts them from this
 # file with yq. Keep each one self-contained: it reads its inputs from env only.
@@ -45,6 +46,20 @@ on:
         type: string
         required: false
         default: "ci.yaml"
+      base_branch:
+        description: >-
+          The trunk a release is merged into, the same as version-bump-pr's (empty: the
+          repository's default branch). The push must be to it, and the pull request into it.
+        type: string
+        required: false
+        default: ""
+      ci_timeout_minutes:
+        description: >-
+          Minutes to wait for ci_workflow to pass on the merge commit (1 to 350). The ci job's own
+          timeout is this plus 10.
+        type: number
+        required: false
+        default: 30
     outputs:
       release:
         description: "true only when the push is an authorized release and CI passed on it; otherwise empty"
@@ -80,15 +95,21 @@ jobs:
       previous: ${{ steps.versions.outputs.previous }}
 
     steps:
-      - name: Refuse anything but a push to the default branch
+      - name: Refuse anything but a push to the trunk
+        id: guard
         env:
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_BRANCH: ${{ inputs.base_branch || github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" != "push" ] || [ -z "$DEFAULT_BRANCH" ] || [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
-            echo "release-on-merge runs on a push to the default branch (${DEFAULT_BRANCH:-unknown}) only, got $EVENT on $REF. Nothing was changed." >&2
+          if [ -z "$BASE_BRANCH" ] || ! [[ "$BASE_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] \
+            || [[ "$BASE_BRANCH" == *..* || "/$BASE_BRANCH/" == *//* || "/$BASE_BRANCH/" == */.* || "$BASE_BRANCH" == *.lock ]]; then
+            echo "base_branch '$BASE_BRANCH' is not a plain branch name. Nothing was changed." >&2
+            exit 1
+          fi
+          if [ "$EVENT" != "push" ] || [ "$REF" != "refs/heads/$BASE_BRANCH" ]; then
+            echo "release-on-merge runs on a push to the trunk ($BASE_BRANCH) only, got $EVENT on $REF. Nothing was changed." >&2
             exit 1
           fi
 
@@ -210,15 +231,30 @@ jobs:
       authorized: ${{ steps.authorize.outputs.authorized }}
       version: ${{ steps.authorize.outputs.version }}
       tag: ${{ steps.authorize.outputs.tag }}
+      ci_job_timeout: ${{ steps.ci-timeout.outputs.job_timeout }}
 
     steps:
+      # Expressions cannot add, so the ci job's timeout (the wait plus a margin) is computed here,
+      # before any API call, and a wrong input fails before anything is decided.
+      - name: Check the CI wait
+        id: ci-timeout
+        env:
+          CI_TIMEOUT: ${{ inputs.ci_timeout_minutes }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$CI_TIMEOUT" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$CI_TIMEOUT" -gt 350 ]; then
+            echo "ci_timeout_minutes must be a whole number of minutes from 1 to 350, got '$CI_TIMEOUT'. Nothing was released." >&2
+            exit 1
+          fi
+          echo "job_timeout=$((CI_TIMEOUT + 10))" >> "$GITHUB_OUTPUT"
+
       - name: Authorize the release by its pull request
         id: authorize
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_BRANCH: ${{ inputs.base_branch || github.event.repository.default_branch }}
           VERSION: ${{ needs.versions.outputs.version }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
           ALLOWED_FILES: ${{ inputs.allowed_files }}
@@ -285,7 +321,7 @@ jobs:
           SUBJECT=$(jq -r '.commit.message // "" | split("\n")[0]' <<<"$COMMIT")
           echo "Pushed commit $SHA: '$SUBJECT' (diagnostic only); first parent $PARENT."
 
-          # What the push changed on the default branch.
+          # What the push changed on the trunk.
           if ! COMPARE=$(gh api "repos/$REPO/compare/$PARENT...$SHA"); then
             fail "Could not compare $PARENT...$SHA. Nothing was released; re-run once the API answers."
           fi
@@ -324,7 +360,7 @@ jobs:
             if ! PR=$(gh api "repos/$REPO/pulls/$number"); then
               fail "Could not read pull request #$number. Nothing was released; re-run once the API answers."
             fi
-            if ! VERDICT=$(jq -r --arg sha "$SHA" --arg repo "$REPO" --arg base "$DEFAULT_BRANCH" --arg head "$BRANCH" --arg bot "$BOT_NAME" '
+            if ! VERDICT=$(jq -r --arg sha "$SHA" --arg repo "$REPO" --arg base "$BASE_BRANCH" --arg head "$BRANCH" --arg bot "$BOT_NAME" '
               if type != "object" then error("not a pull request") else . end
               | [
                   (if .merged != true or .merged_at == null then "not merged" else empty end),
@@ -400,13 +436,13 @@ jobs:
             echo "tag=$TAG"
           } >> "$GITHUB_OUTPUT"
 
-  # The tag is never created before the default branch's CI passed on this exact commit: the newest
-  # run of ci_workflow on this SHA, for the push to the default branch, with ci-result green.
+  # The tag is never created before the trunk's CI passed on this exact commit: the newest run of
+  # ci_workflow on this SHA, for the push to the trunk, with ci-result green.
   ci:
     needs: authorize
     if: needs.authorize.outputs.authorized == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: ${{ fromJSON(needs.authorize.outputs.ci_job_timeout) }}
     permissions:
       actions: read
     outputs:
@@ -420,7 +456,8 @@ jobs:
           sha: ${{ github.sha }}
           workflow: .github/workflows/${{ inputs.ci_workflow }}
           accepted-events: push
-          default-branch: ${{ github.event.repository.default_branch }}
+          default-branch: ${{ inputs.base_branch || github.event.repository.default_branch }}
+          timeout: ${{ inputs.ci_timeout_minutes }}
 
       # Reached only when the gate passed: the one place that says "release".
       - name: Mark the release

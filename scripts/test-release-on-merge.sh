@@ -48,7 +48,9 @@ extract() {
 		exit 1
 	fi
 }
+extract versions guard
 extract versions versions
+extract authorize ci-timeout
 extract authorize authorize
 
 # The gh stub. State lives under $GH_STUB_DIR, one file per endpoint, printed raw (so several JSON
@@ -129,6 +131,38 @@ expect_fail() {
 	local name=$1 pattern=$2
 	if [ "$STATUS" -ne 0 ] && grep -q -- "$pattern" <<<"$LOG"; then ok "$name"; else not_ok "$name (want a failure matching '$pattern', status $STATUS)" "$LOG"; fi
 }
+
+echo "# guard"
+
+guard() { run_step guard EVENT="${3:-push}" REF="$1" BASE_BRANCH="$2"; }
+guard refs/heads/main main
+if [ "$STATUS" -eq 0 ]; then ok "a push to the trunk passes the guard"; else not_ok "a push to the trunk passes the guard" "$LOG"; fi
+guard refs/heads/rust-rewrite rust-rewrite
+if [ "$STATUS" -eq 0 ]; then ok "a push to base_branch passes the guard"; else not_ok "a push to base_branch passes the guard" "$LOG"; fi
+guard refs/heads/master rust-rewrite
+expect_fail "a push to the default branch is refused when base_branch names another trunk" "push to the trunk (rust-rewrite) only"
+guard refs/heads/main main workflow_dispatch
+expect_fail "a dispatch is refused" "got workflow_dispatch on refs/heads/main"
+for bad in "" "a b" "a..b" "main/" ".x" "main.lock"; do
+	guard "refs/heads/$bad" "$bad"
+	expect_fail "the trunk name '$bad' is refused" "not a plain branch name"
+done
+
+echo "# ci timeout"
+
+ci_timeout() { run_step ci-timeout CI_TIMEOUT="$1"; }
+for pair in 30:40 90:100 1:11 350:360; do
+	ci_timeout "${pair%%:*}"
+	if [ "$STATUS" -eq 0 ] && [ "$(out job_timeout)" = "${pair##*:}" ]; then
+		ok "a ${pair%%:*}-minute wait gives the ci job ${pair##*:} minutes"
+	else
+		not_ok "a ${pair%%:*}-minute wait gives the ci job ${pair##*:} minutes" "$LOG$OUTPUT"
+	fi
+done
+for bad in "" 0 351 -5 1.5 abc 030 "30 "; do
+	ci_timeout "$bad"
+	expect_fail "the CI wait '$bad' is refused" "ci_timeout_minutes must be"
+done
 
 echo "# versions"
 
@@ -314,7 +348,7 @@ edit() {
 	mv "$file.new" "$file"
 }
 authorize() {
-	run_step authorize REPO=leinardi/test SHA="${SHA_IN-$SHA}" DEFAULT_BRANCH=main VERSION="${VERSION_IN-1.3.0}" \
+	run_step authorize REPO=leinardi/test SHA="${SHA_IN-$SHA}" BASE_BRANCH="${BASE-main}" VERSION="${VERSION_IN-1.3.0}" \
 		TAG_PREFIX="${PREFIX-v}" ALLOWED_FILES="${ALLOWED-VERSION}" GH_TOKEN=stub \
 		AUTHORIZE_ATTEMPTS="${ATTEMPTS:-1}" AUTHORIZE_DELAY=0
 }
@@ -430,6 +464,20 @@ expect_refused "merged into another branch: refused" "into leinardi/test:develop
 fixture
 edit pr.42 '.base.repo.full_name = "someone/test"'
 expect_refused "merged into another repository: refused" "into someone/test:main"
+
+fixture
+edit pr.42 '.base.ref = "rust-rewrite"'
+BASE=rust-rewrite authorize
+if [ "$STATUS" -eq 0 ] && [ "$(out authorized)" = true ]; then
+	ok "merged into base_branch: authorized"
+else
+	not_ok "merged into base_branch: authorized" "$LOG"
+fi
+fixture
+BASE=rust-rewrite
+expect_refused "merged into the default branch while base_branch names another trunk: refused" \
+	"into leinardi/test:main, not leinardi/test:rust-rewrite"
+unset BASE
 
 echo "# authorize: content"
 
@@ -610,6 +658,15 @@ check "the workflow's group is its own and never cancelled" \
 	"$(wf '.concurrency.group + " " + (.concurrency["cancel-in-progress"] | tostring)')" \
 	"release-on-merge-\${{ github.repository }} false"
 check "every job has a timeout" "$(wf '[.jobs[] | has("timeout-minutes")] | all')" "true"
+TRUNK="\${{ inputs.base_branch || github.event.repository.default_branch }}"
+check "the guard, the authorization and the CI wait all read the same trunk" \
+	"$(wf '[(.jobs.versions.steps[] | select(.id == "guard") | .env.BASE_BRANCH), (.jobs.authorize.steps[] | select(.id == "authorize") | .env.BASE_BRANCH), .jobs.ci.steps[0].with["default-branch"]] | join(" ")')" \
+	"$TRUNK $TRUNK $TRUNK"
+check "ci: the wait is the input, the job timeout the checked value" \
+	"$(wf '.jobs.ci.steps[0].with.timeout + " " + .jobs.ci["timeout-minutes"]')" \
+	"\${{ inputs.ci_timeout_minutes }} \${{ fromJSON(needs.authorize.outputs.ci_job_timeout) }}"
+check "the CI wait defaults to 30 minutes" "$(wf '.on.workflow_call.inputs.ci_timeout_minutes.default')" "30"
+check "authorize: the CI wait is checked before the API calls" "$(wf '.jobs.authorize.steps[0].id')" "ci-timeout"
 
 echo
 echo "$PASS passed, $FAIL failed"
