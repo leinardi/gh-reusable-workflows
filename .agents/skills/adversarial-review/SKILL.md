@@ -17,42 +17,20 @@ runs in other repositories, with their token, the next time `v1` moves: the fail
 ships to every caller at once. Find the input, repository state or re-run where it breaks.
 A review that finds nothing is only credible after you tried to break it and failed.
 
-Copy this checklist and tick items as you go:
+## Scope
 
-```text
-Review progress:
-- [ ] 1. Diff and intent established (default scope if none given)
-- [ ] 2. AGENTS.md and the contracts it names read
-- [ ] 3. Repository invariants checked
-- [ ] 4. Adversarial passes run
-- [ ] 5. Findings confirmed or dropped; gates run
-- [ ] 6. Report written
-```
+When invoked directly: review the scope the user gives (`gh pr diff <n>` for a PR); with none,
+the uncommitted work (`git diff HEAD` plus untracked files); on a clean tree, `git diff
+main...HEAD`. Read every changed workflow in full, its `.md` contract next to it, and the stated
+intent (`git log --oneline` for the range): the code is checked against it.
 
-## 1. Establish the diff
-
-With no scope given, review the uncommitted work; if the tree is clean, review the branch
-against `main`.
-
-| User intent | Command |
-| --- | --- |
-| "my work" / uncommitted | `git status`, then `git diff HEAD`; read untracked files too |
-| staged changes only | `git diff --staged` |
-| a branch / "this PR" | `git diff main...HEAD` |
-| a commit range | `git diff <base>..<head>` |
-| a GitHub PR number | `gh pr diff <n>` and `gh pr view <n>` |
-
-Read `git log --oneline` for the range: the stated intent is what the code is checked against.
-A commit type that ships the wrong version is a finding too (pass in §4).
-Read every changed workflow in full, and its `.md` contract next to it.
-
-## 2. Load project authority
+## Authority
 
 Read `AGENTS.md` (the invariants) before judging anything. The `.md` next to each reusable
 workflow is its public contract: a behaviour change without a matching `.md` change is a finding,
 and so is a `.md` promise the YAML does not keep.
 
-## 3. Repository invariants — check on every review
+## Repository invariants
 
 ### Callers of `v1`
 
@@ -124,7 +102,20 @@ something other than `env:`, silently drops or breaks its tests. A behaviour cha
 script without a new case in its `scripts/test-*.sh` is a gap. Logic moved into a
 `leinardi/gh-composite-actions` action is tested there; check that the pinned release has it.
 
-## 4. Adversarial passes
+### Commits and releases
+
+`svu` derives this repository's release from the commits since the last tag, and every commit
+lands as it is (merge commits). A change to what a caller runs (a reusable workflow or anything
+it executes) typed `chore`, `ci`, `docs` or `refactor` never reaches `v1`; a `feat` or `fix` on a
+`local-*` workflow, a test or a doc cuts a release that moves `v1` for nothing; a stray `!` or
+`BREAKING CHANGE:` cuts a `v2`. `svu` also matches `feat`/`fix` anywhere before a colon
+(`prefix:` counts as `fix:`). See `AGENTS.md`.
+
+### License-header script
+
+A change to `scripts/check-license-headers.sh` must still fail on a file without the header.
+
+## Adversarial passes
 
 - **Correctness:** a `grep` that matches a prefix (`v1.2` vs `v1.20`), `sort` without `-V`, an
   unanchored regex, `set -e` swallowed inside `$(...)` or a pipeline.
@@ -133,12 +124,6 @@ script without a new case in its `scripts/test-*.sh` is a gap. Logic moved into 
 - **Concurrency:** two runs in flight (job `concurrency` must serialize them), a tag pushed by
   someone else between the check and the publish.
 - **Contract drift:** the `.md`, `README.md` and `AGENTS.md` still describe what the YAML does.
-- **Commit type matches whether it ships:** `svu` derives this repository's release from the
-  commits since the last tag, and every commit lands as it is (merge commits). A change to what a
-  caller runs (a reusable workflow or anything it executes) typed `chore`, `ci`, `docs` or
-  `refactor` never reaches `v1`; a `feat` or `fix` on a `local-*` workflow, a test or a doc cuts a
-  release that moves `v1` for nothing; a stray `!` or `BREAKING CHANGE:` cuts a `v2`. `svu` also
-  matches `feat`/`fix` anywhere before a colon (`prefix:` counts as `fix:`). See `AGENTS.md`.
 - **A check that can no longer fail:** `scripts/test-*.sh` and `scripts/check-license-headers.sh`
   guard claims nobody re-checks by hand. Make the guarded thing go wrong and see whether the check
   still notices. A test whose `yq` extraction now returns nothing (a renamed step `id`), a case
@@ -146,23 +131,21 @@ script without a new case in its `scripts/test-*.sh` is a gap. Logic moved into 
   hook that lost `always_run`, or a CI job that skips the hook, adds `|| true` or
   `continue-on-error`, is a false pass: a finding.
 
-For each candidate finding, reproduce it or trace the failing input end to end. If that confirms
-it, report it; if not, dig once more, then drop it. No named input and wrong result, no finding.
+## Gates
 
-## 5. Verify
+Do not re-run the repository's gates (`make test`, `make check`). The implementer is expected to
+run them and CI runs them again, but do not assume either happened: report the verification
+evidence you actually have (under adversarial-review-loop, `verification.txt` when supplied,
+which is the implementer's claim and not proof; when invoked directly, the CI status or gate
+output in the PR or session) and what is missing, such as a release-workflow change with no run
+in a disposable repository that calls the branch SHA (a real release can only be proven there),
+or a release state (nothing, draft, published with assets missing, complete) not exercised.
+Never say that a check you did not see passed. Judge whether the change's tests prove it: a
+behaviour change needs a test that fails on the old code. When invoked directly, one focused
+test (`bash scripts/test-<workflow>.sh`) may be run to confirm a single suspected finding, never
+a full suite or gate. A candidate that is neither reproduced nor traced end to end is dropped.
 
-| Diff touched | Run |
-| --- | --- |
-| `simple-tag-and-release.yaml`, `version-bump-pr.yaml`, `release-on-merge.yaml`, `scripts/test-*` | `make test`, then `make check` |
-| `pre-commit-warmup.yaml` | `make test`, then `make check` |
-| `scripts/check-license-headers.sh` | the script, once as is and once on a file without the header |
-| any workflow | `make check` (actionlint, yamllint, prettier) |
-| anything else | `make check` |
-
-A real release can only be proven in a disposable repository that calls the branch SHA. Say
-which states you could not exercise rather than implying they passed.
-
-## 6. Report
+## Report
 
 Rank worst first:
 
@@ -172,4 +155,5 @@ Rank worst first:
   Fix: <the specific change>
 ```
 
-End with a verdict: **block**, **approve with nits**, or **approve**, and the gates you ran.
+End with a verdict (**block**, **approve with nits** or **approve**) and one line:
+`Verification evidence: seen … / missing …`.
